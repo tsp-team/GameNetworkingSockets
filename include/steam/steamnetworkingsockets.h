@@ -14,6 +14,9 @@
 
 extern "C" {
 
+STEAMNETWORKINGSOCKETS_INTERFACE ISteamNetworkingSockets *GameNetworkingSockets_CreateInstance( const SteamNetworkingIdentity *pIdentity, SteamNetworkingErrMsg &errMsg );
+STEAMNETWORKINGSOCKETS_INTERFACE void GameNetworkingSockets_KillInstance( ISteamNetworkingSockets *pInstance );
+
 // Initialize the library.  Optionally, you can set an initial identity for the default
 // interface that is returned by SteamNetworkingSockets().
 //

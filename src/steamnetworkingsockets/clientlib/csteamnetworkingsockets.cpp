@@ -1635,6 +1635,29 @@ using namespace SteamNetworkingSocketsLib;
 
 #ifdef STEAMNETWORKINGSOCKETS_OPENSOURCE
 
+STEAMNETWORKINGSOCKETS_INTERFACE ISteamNetworkingSockets *GameNetworkingSockets_CreateInstance( const SteamNetworkingIdentity *pIdentity, SteamNetworkingErrMsg &errMsg )
+{
+	SteamDatagramTransportLock lock( "GameNetworkingSockets_CreateInstance" );
+	CSteamNetworkingSockets *pSteamNetworkingSockets = new CSteamNetworkingSockets( (CSteamNetworkingUtils *)SteamNetworkingUtils() );
+	if ( !pSteamNetworkingSockets->BInitGameNetworkingSockets( pIdentity, errMsg ) )
+	{
+		pSteamNetworkingSockets->Destroy();
+		return nullptr;
+	}
+
+	return pSteamNetworkingSockets;
+}
+
+STEAMNETWORKINGSOCKETS_INTERFACE void GameNetworkingSockets_KillInstance( ISteamNetworkingSockets *pInstance )
+{
+	SteamDatagramTransportLock lock( "GameNetworkingSockets_KillInstance" );
+
+	if ( pInstance )
+	{
+		( (CSteamNetworkingSockets *)pInstance )->Destroy();
+	}
+}
+
 static CSteamNetworkingSockets *s_pSteamNetworkingSockets = nullptr;
 
 STEAMNETWORKINGSOCKETS_INTERFACE bool GameNetworkingSockets_Init( const SteamNetworkingIdentity *pIdentity, SteamNetworkingErrMsg &errMsg )
