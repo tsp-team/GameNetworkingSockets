@@ -273,11 +273,13 @@ add_library(GameNetworkingSockets SHARED "")
 add_library(GameNetworkingSockets::shared ALIAS GameNetworkingSockets)
 gamenetworkingsockets_common(GameNetworkingSockets)
 add_sanitizers(GameNetworkingSockets)
+install(TARGETS GameNetworkingSockets)
 
 add_library(GameNetworkingSockets_s STATIC "")
 add_library(GameNetworkingSockets::static ALIAS GameNetworkingSockets_s)
 target_compile_definitions(GameNetworkingSockets_s INTERFACE STEAMNETWORKINGSOCKETS_STATIC_LINK)
 gamenetworkingsockets_common(GameNetworkingSockets_s)
 add_sanitizers(GameNetworkingSockets_s)
+install(TARGETS GameNetworkingSockets_s)
 
 # vim: set ts=4 sts=4 sw=4 noet:

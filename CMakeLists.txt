@@ -137,4 +137,6 @@ message(STATUS "Crypto library for AES/SHA256: ${USE_CRYPTO}")
 message(STATUS "Crypto library for ed25519/curve25519: ${USE_CRYPTO25519}")
 message(STATUS "---------------------------------------------------------")
 
+install(DIRECTORY ./include DESTINATION ${CMAKE_INSTALL_PREFIX})
+
 # vim: set ts=4 sts=4 sw=4 noet:
