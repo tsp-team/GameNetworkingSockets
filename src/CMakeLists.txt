@@ -275,6 +275,7 @@ add_sanitizers(GameNetworkingSockets)
 
 add_library(GameNetworkingSockets_s STATIC "")
 add_library(GameNetworkingSockets::static ALIAS GameNetworkingSockets_s)
+set_target_properties(GameNetworkingSockets_s PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_definitions(GameNetworkingSockets_s INTERFACE STEAMNETWORKINGSOCKETS_STATIC_LINK)
 gamenetworkingsockets_common(GameNetworkingSockets_s)
 add_sanitizers(GameNetworkingSockets_s)
