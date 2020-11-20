@@ -33,12 +33,19 @@ cmake_install.cmake
 perf.data
 perf.data.old
 
+# Default/recommended install directory for vcpkg
+/vcpkg
+
 *.VC.*
 /.vscode
 /build
 /build-*
+/log.txt
 /src/.vs/*
 /src/steamnetworkingsockets/Messageswin64Debug/*
 /src/steamnetworkingsockets/certtool/win64/*
 /src/steamnetworkingsockets/clientlib/win64/*
 *.swp
+
+*partner*
+

@@ -3,7 +3,8 @@ Building
 
 ## Dependencies
 
-* CMake or Meson, and build tool like Ninja, GNU Make or Visual Studio
+* CMake 3.10 or later
+* A build tool like Ninja, GNU Make or Visual Studio
 * A C++11-compliant compiler, such as:
   * GCC 7.3 or later
   * Clang 3.3 or later
@@ -12,8 +13,18 @@ Building
   * OpenSSL 1.1.1 or later
   * OpenSSL 1.1.x, plus ed25519-donna and curve25519-donna.  (We've made some
     minor changes, so the source is included in this project.)
-  * [bcrypt](https://docs.microsoft.com/en-us/windows/desktop/api/bcrypt/) (windows only)
+  * libsodium
+  * [bcrypt](https://docs.microsoft.com/en-us/windows/desktop/api/bcrypt/)
+    (windows only)
 * Google protobuf 2.6.1+
+* Google [webrtc](https://opensource.google/projects/webrtc) is used for
+  NAT piercing (ICE) for P2P connections.  The relevant code is linked in as a
+  git submodule.  You'll need to initialize that submodule to compile.
+
+## Known Issues
+* The build may have link errors when building with LLVM 10+:
+  [LLVM bug #46313](https://bugs.llvm.org/show_bug.cgi?id=46313). As
+  a workaround, consider building the library with GCC instead.
 
 ## Linux
 
@@ -37,14 +48,7 @@ Arch Linux:
 
 ### Building
 
-Using Meson:
-
-```
-$ meson . build
-$ ninja -C build
-```
-
-Or CMake:
+Using CMake (preferred):
 
 ```
 $ mkdir build
@@ -55,10 +59,36 @@ $ ninja
 
 ## Windows / Visual Studio
 
-Unfortuanetly, because Windows lacks a robust package ecosystem, getting setup
-is a bit of an arduous gauntlet.
+On Windows, you can use the [vcpkg](https://github.com/microsoft/vcpkg/) package manager.
+The following instructions assume that you will follow the vcpkg recommendations and install
+vcpkg as a subfolder.  If you want to install vcpkg somewhere else, you're on your own.
+See the [quick start](https://github.com/microsoft/vcpkg/#quick-start-windows) for more info.
 
-### OpenSSL
+First, bootstrap vcpkg.  From the root folder of your GameNetworkingSockets workspace:
+
+```
+> git clone https://github.com/microsoft/vcpkg
+> .\vcpkg\bootstrap-vcpkg.bat
+```
+
+The following command will build the prerequisites and GameNetworkingSockets.
+You can use the vcpkg option `--triplet x64-windows` or `--triplet x86-windows` to force
+the hoice of a particular target architecture.  To use libsodium as the crypto backend
+rather than OpenSSL, install `gamenetworkingsockets[core,libsodium]`.
+
+```
+> .\vcpkg\vcpkg --overlay-ports=vcpkg_ports install gamenetworkingsockets
+```
+
+The library should be immediately available in Visual Studio projects if
+the vcpkg integration is installed, or the vcpkg CMake toolchain file can
+be used for CMake-based projects.
+
+### Manual setup
+
+Setting up the dependencies by hand is a bit of an arduous gauntlet.
+
+#### OpenSSL
 
 You can install the [OpenSSL binaries](https://slproweb.com/products/Win32OpenSSL.html)
 provided by Shining Light Productions. The Windows CMake distribution understands
@@ -69,7 +99,7 @@ easier. Be sure to pick the installers **without** the "Light"suffix. In this in
 For CMake to find the libraries, you may need to set the environment variable
 `OPENSSL_ROOT_DIR`.
 
-### Checking prerequisites
+#### Checking prerequisites
 
 Start a Visual Studio Command Prompt (2017+), and double-check
 that you have everything you need.  Note that Visual Studio comes with these tools,
@@ -99,7 +129,7 @@ C:\dev> ninja --version
 ```
 
 
-### Protobuf
+#### Protobuf
 
 Instructions for getting a working installation of google protobuf on Windows can
 be found [here](https://github.com/protocolbuffers/protobuf/blob/master/cmake/README.md).
@@ -138,7 +168,7 @@ C:\dev\protobuf\cmake_build> ninja
 C:\dev\protobuf\cmake_build> ninja install
 ```
 
-### Building
+#### Building
 
 Start a Visual Studio Command Prompt, and create a directory to hold the build output.
 
@@ -205,7 +235,6 @@ a 32-bit build, install the i686 versions of these packages):
 $ pacman -S \
     git \
     mingw-w64-x86_64-gcc \
-    mingw-w64-x86_64-meson \
     mingw-w64-x86_64-openssl \
     mingw-w64-x86_64-pkg-config \
     mingw-w64-x86_64-protobuf
@@ -216,8 +245,10 @@ And finally, clone the repository and build it:
 ```
 $ git clone https://github.com/ValveSoftware/GameNetworkingSockets.git
 $ cd GameNetworkingSockets
-$ meson . build
-$ ninja -C build
+$ mkdir build
+$ cd build
+$ cmake -G Ninja ..
+$ ninja
 ```
 
 **NOTE:** When building with MSYS2, be sure you launch the correct version of
@@ -243,9 +274,3 @@ This extension allows for configuring the CMake project and building it from
 within the Visual Studio Code IDE.
 
 VS Marketplace Link: https://marketplace.visualstudio.com/items?itemName=vector-of-bool.cmake-tools
-
-### Meson by Ali Sabil
-This extension comes in handy if you're editing the Meson build files.
-
-VS Marketplace Link: https://marketplace.visualstudio.com/items?itemName=asabil.meson
-

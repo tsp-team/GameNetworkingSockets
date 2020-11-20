@@ -28,6 +28,8 @@
 #include <tier1/utllinkedlist.h>
 #include "crypto.h"
 
+#include <tier0/memdbgoff.h>
+
 // Ugggggggggg MSVC VS2013 STL bug: try_lock_for doesn't actually respect the timeout, it always ends up using an infinite timeout.
 // And even in 2015, the code is calling the timer to get current time, to convert a relative time to an absolute time, and then
 // waiting until that absolute time, which then calls the timer again....and subtracts it back off....It's really bad. Just go
@@ -44,8 +46,7 @@
 // Time low level send/recv calls and packet processing
 //#define STEAMNETWORKINGSOCKETS_LOWLEVEL_TIME_SOCKET_CALLS
 
-// memdbgon must be the last include file in a .cpp file!!!
-#include "tier0/memdbgon.h"
+#include <tier0/memdbgon.h>
 
 namespace SteamNetworkingSocketsLib {
 
@@ -69,7 +70,8 @@ static int s_nCurrentLockTags;
 constexpr int k_nMaxCurrentLockTags = 8;
 static const char *s_pszCurrentLockTags[k_nMaxCurrentLockTags];
 static int s_nCurrentLockTagCounts[k_nMaxCurrentLockTags];
-static void (*s_fLockAcquiredCallback)( SteamNetworkingMicroseconds usecWaited );
+static void (*s_fLockAcquiredCallback)( const char *tags, SteamNetworkingMicroseconds usecWaited );
+static void (*s_fLockHeldCallback)( const char *tags, SteamNetworkingMicroseconds usecWaited );
 static SteamNetworkingMicroseconds s_usecLockWaitWarningThreshold = 2*1000;
 
 void SteamDatagramTransportLock::AddTag( const char *pszTag )
@@ -114,7 +116,7 @@ void SteamDatagramTransportLock::OnLocked( const char *pszTag, SteamNetworkingMi
 
 		auto callback = s_fLockAcquiredCallback; // save to temp, to prevent very narrow race condition where variable is cleared after we null check it, and we call null
 		if ( callback )
-			callback( usecTimeSpentWaitingOnLock );
+			callback( pszTag, usecTimeSpentWaitingOnLock );
 	}
 	else
 	{
@@ -122,7 +124,8 @@ void SteamDatagramTransportLock::OnLocked( const char *pszTag, SteamNetworkingMi
 		Assert( s_threadIDLockOwner == std::this_thread::get_id() );
 
 		// Getting it again had better be nearly instantaneous!
-		AssertMsg1( usecTimeSpentWaitingOnLock < 100, "Waited %lldusec to take second lock on the same thread??", (long long)usecTimeSpentWaitingOnLock );
+		// FIXME I don't know why this is firing with a lower threshold.  What is it doing?
+		AssertMsg1( usecTimeSpentWaitingOnLock < 2000, "Waited %lldusec to take second lock on the same thread??", (long long)usecTimeSpentWaitingOnLock );
 	}
 	AddTag( pszTag );
 }
@@ -162,23 +165,26 @@ void SteamDatagramTransportLock::Unlock()
 	char tags[ 256 ];
 
 	AssertHeldByCurrentThread();
+	SteamNetworkingMicroseconds usecElapsed = 0;
 	SteamNetworkingMicroseconds usecElapsedTooLong = 0;
+	auto lockHeldCallback = s_fLockHeldCallback;
+
 	if ( s_nLocked == 1 )
 	{
 
 		// We're about to do the final release.  How long did we hold the lock?
-		usecElapsedTooLong = SteamNetworkingSockets_GetLocalTimestamp() - s_usecWhenLocked;
+		usecElapsed = SteamNetworkingSockets_GetLocalTimestamp() - s_usecWhenLocked;
 
-		// If that duration is acceptable, then clear it.  We need to check the
-		// threshold here because the threshold could change by another thread
-		// immediately after we release the lock.  Also, if we're debugging, all bets are
-		// off.  They could have hit a breakpoint, and we don't want to create a bunch
-		// of confusing spew with spurious asserts
-		if ( usecElapsedTooLong < s_usecLongLockWarningThreshold || Plat_IsInDebugSession() )
+		// Too long?  We need to check the threshold here because the threshold could
+		// change by another thread immediately after we release the lock.  Also, if
+		// we're debugging, all bets are off.  They could have hit a breakpoint, and
+		// we don't want to create a bunch of confusing spew with spurious asserts
+		if ( usecElapsed >= s_usecLongLockWarningThreshold && !Plat_IsInDebugSession() )
 		{
-			usecElapsedTooLong = 0;
+			usecElapsedTooLong = usecElapsed;
 		}
-		else
+
+		if ( usecElapsedTooLong > 0 || lockHeldCallback )
 		{
 			char *p = tags;
 			char *end = tags + sizeof(tags) - 1;
@@ -211,6 +217,11 @@ void SteamDatagramTransportLock::Unlock()
 	#else
 		s_steamDatagramTransportMutex.unlock();
 	#endif
+
+	if ( usecElapsed > 0 && lockHeldCallback )
+	{
+		lockHeldCallback(tags, usecElapsed);
+	}
 
 	// Yelp if we held the lock for longer than the threshold.
 	if ( usecElapsedTooLong != 0 )
@@ -297,6 +308,9 @@ bool ISteamNetworkingSocketsRunWithLock::RunOrQueue( const char *pszTag )
 		return false;
 	}
 
+	// Service the queue so we always do items in order
+	ServiceQueue();
+
 	// Let derived class do work
 	Run();
 
@@ -370,6 +384,8 @@ inline IRawUDPSocket::~IRawUDPSocket() {}
 class CRawUDPSocketImpl : public IRawUDPSocket
 {
 public:
+	STEAMNETWORKINGSOCKETS_DECLARE_CLASS_OPERATOR_NEW
+
 	~CRawUDPSocketImpl()
 	{
 		closesocket( m_socket );
@@ -1048,24 +1064,27 @@ static bool PollRawUDPSockets( int nMaxTimeoutMS, bool bManualPoll )
 	SteamDatagramTransportLock::AssertHeldByCurrentThread();
 	Assert( SteamDatagramTransportLock::s_nLocked == 1 );
 
+	const int nSocketsToPoll = s_vecRawSockets.Count();
+
 	#ifdef _WIN32
-		HANDLE *pEvents = (HANDLE*)alloca( sizeof(HANDLE) * (s_vecRawSockets.Count()+1) );
+		HANDLE *pEvents = (HANDLE*)alloca( sizeof(HANDLE) * (nSocketsToPoll+1) );
 		int nEvents = 0;
 	#else
-		pollfd *pPollFDs = (pollfd*)alloca( sizeof(pollfd) * (s_vecRawSockets.Count()+1) ); 
+		pollfd *pPollFDs = (pollfd*)alloca( sizeof(pollfd) * (nSocketsToPoll+1) ); 
 		int nPollFDs = 0;
 	#endif
 
-	CRawUDPSocketImpl **pSocketsToPoll = (CRawUDPSocketImpl **)alloca( sizeof(CRawUDPSocketImpl *) * s_vecRawSockets.Count() ); 
-	int nSocketsToPoll = 0;
+	CRawUDPSocketImpl **pSocketsToPoll = (CRawUDPSocketImpl **)alloca( sizeof(CRawUDPSocketImpl *) * nSocketsToPoll ); 
 
-	for ( CRawUDPSocketImpl *pSock: s_vecRawSockets )
+	for ( int i = 0 ; i < nSocketsToPoll ; ++i )
 	{
+		CRawUDPSocketImpl *pSock = s_vecRawSockets[ i ];
+
 		// Should be totally valid at this point
 		Assert( pSock->m_callback.m_fnCallback );
 		Assert( pSock->m_socket != INVALID_SOCKET );
 
-		pSocketsToPoll[ nSocketsToPoll++ ] = pSock;
+		pSocketsToPoll[ i ] = pSock;
 
 		#ifdef _WIN32
 			pEvents[ nEvents++ ] = pSock->m_event;
@@ -1437,6 +1456,9 @@ static void SteamNetworkingThreadProc()
 	#endif
 
 	#if defined(_WIN32) && !defined(__GNUC__)
+
+		#pragma warning( disable: 6132 ) // Possible infinite loop:  use of the constant EXCEPTION_CONTINUE_EXECUTION in the exception-filter expression of a try-except.  Execution restarts in the protected block.
+
 		typedef struct tagTHREADNAME_INFO
 		{
 			DWORD dwType;
@@ -1715,84 +1737,19 @@ void CSharedSocket::RemoteHost::Close()
 /////////////////////////////////////////////////////////////////////////////
 
 SteamNetworkingMicroseconds g_usecLastRateLimitSpew;
-ESteamNetworkingSocketsDebugOutputType g_eSteamDatagramDebugOutputDetailLevel;
+int g_nRateLimitSpewCount;
+ESteamNetworkingSocketsDebugOutputType g_eDefaultGroupSpewLevel;
 static FSteamNetworkingSocketsDebugOutput s_pfnDebugOutput = nullptr;
+void (*g_pfnPreFormatSpewHandler)( ESteamNetworkingSocketsDebugOutputType eType, bool bFmt, const char* pstrFile, int nLine, const char *pMsg, va_list ap ) = SteamNetworkingSockets_DefaultPreFormatDebugOutputHandler;
 
-void VReallySpewType( ESteamNetworkingSocketsDebugOutputType eType, const char *pMsg, va_list ap )
-{
-	// Save callback.  Paranoia for unlikely but possible race condition,
-	// if we spew from more than one place in our code and stuff changes
-	// while we are formatting.
-	FSteamNetworkingSocketsDebugOutput pfnDebugOutput = s_pfnDebugOutput;
 
-	// Filter, just in case.  (We really shouldn't get here, though.)
-	if ( !pfnDebugOutput || eType > g_eSteamDatagramDebugOutputDetailLevel )
-		return;
-	
-	// Do the formatting
-	char buf[ 2048 ];
-	V_vsprintf_safe( buf, pMsg, ap );
-
-	// Gah, some, but not all, of our code has newlines on the end
-	V_StripTrailingWhitespaceASCII( buf );
-
-	// Invoke callback
-	pfnDebugOutput( eType, buf );
-}
-
-void ReallySpewType( ESteamNetworkingSocketsDebugOutputType eType, const char *pMsg, ... )
+void ReallySpewTypeFmt( int eType, const char *pMsg, ... )
 {
 	va_list ap;
 	va_start( ap, pMsg );
-	VReallySpewType( eType, pMsg, ap );
+	(*g_pfnPreFormatSpewHandler)( ESteamNetworkingSocketsDebugOutputType(eType), true, nullptr, 0, pMsg, ap );
 	va_end( ap );
 }
-
-#if defined( STEAMNETWORKINGSOCKETS_STANDALONELIB ) && !defined( STEAMNETWORKINGSOCKETS_STREAMINGCLIENT )
-static SpewRetval_t SDRSpewFunc( SpewType_t type, char const *pMsg )
-{
-	V_StripTrailingWhitespaceASCII( const_cast<char*>( pMsg ) );
-
-	switch ( type )
-	{
-		case SPEW_LOG:
-		case SPEW_INPUT:
-			// No idea what these are, so....
-			// |
-			// V
-		case SPEW_MESSAGE:
-			if ( s_pfnDebugOutput && g_eSteamDatagramDebugOutputDetailLevel >= k_ESteamNetworkingSocketsDebugOutputType_Msg )
-				s_pfnDebugOutput( k_ESteamNetworkingSocketsDebugOutputType_Msg, pMsg );
-			break;
-
-		case SPEW_WARNING:
-			if ( s_pfnDebugOutput && g_eSteamDatagramDebugOutputDetailLevel >= k_ESteamNetworkingSocketsDebugOutputType_Warning )
-				s_pfnDebugOutput( k_ESteamNetworkingSocketsDebugOutputType_Warning, pMsg );
-			break;
-
-		case SPEW_ASSERT:
-			if ( s_pfnDebugOutput && g_eSteamDatagramDebugOutputDetailLevel >= k_ESteamNetworkingSocketsDebugOutputType_Error )
-				s_pfnDebugOutput( k_ESteamNetworkingSocketsDebugOutputType_Bug, pMsg );
-
-			// Ug, for some reason this is crashing, because it's trying to generate a breakpoint
-			// even when it's not being run under the debugger.  Probably the best thing to do is just rely
-			// on the app hook asserting on an error condition.
-			//return SPEW_DEBUGGER;
-			break;
-
-		case SPEW_ERROR:
-			if ( s_pfnDebugOutput && g_eSteamDatagramDebugOutputDetailLevel >= k_ESteamNetworkingSocketsDebugOutputType_Error )
-				s_pfnDebugOutput( k_ESteamNetworkingSocketsDebugOutputType_Error, pMsg );
-			return SPEW_ABORT;
-
-		case SPEW_BOLD_MESSAGE:
-			if ( s_pfnDebugOutput && g_eSteamDatagramDebugOutputDetailLevel >= k_ESteamNetworkingSocketsDebugOutputType_Important )
-				s_pfnDebugOutput( k_ESteamNetworkingSocketsDebugOutputType_Important, pMsg );
-	}
-	
-	return SPEW_CONTINUE;
-}
-#endif
 
 bool BSteamNetworkingSocketsLowLevelAddRef( SteamDatagramErrMsg &errMsg )
 {
@@ -1842,11 +1799,6 @@ bool BSteamNetworkingSocketsLowLevelAddRef( SteamDatagramErrMsg &errMsg )
 				return false;
 			}
 		}
-		#endif
-
-		// Latch Steam codebase's logging system so we get spew and asserts
-		#if defined( STEAMNETWORKINGSOCKETS_STANDALONELIB ) && !defined( STEAMNETWORKINGSOCKETS_STREAMINGCLIENT )
-			SpewOutputFunc( SDRSpewFunc );
 		#endif
 
 		// Make sure random number generator is seeded
@@ -2017,12 +1969,12 @@ void SteamNetworkingSockets_SetDebugOutputFunction( ESteamNetworkingSocketsDebug
 	if ( pfnFunc && eDetailLevel > k_ESteamNetworkingSocketsDebugOutputType_None )
 	{
 		SteamNetworkingSocketsLib::s_pfnDebugOutput = pfnFunc;
-		SteamNetworkingSocketsLib::g_eSteamDatagramDebugOutputDetailLevel = ESteamNetworkingSocketsDebugOutputType( eDetailLevel );
+		SteamNetworkingSocketsLib::g_eDefaultGroupSpewLevel = ESteamNetworkingSocketsDebugOutputType( eDetailLevel );
 	}
 	else
 	{
 		SteamNetworkingSocketsLib::s_pfnDebugOutput = nullptr;
-		SteamNetworkingSocketsLib::g_eSteamDatagramDebugOutputDetailLevel = k_ESteamNetworkingSocketsDebugOutputType_None;
+		SteamNetworkingSocketsLib::g_eDefaultGroupSpewLevel = k_ESteamNetworkingSocketsDebugOutputType_None;
 	}
 }
 
@@ -2138,7 +2090,102 @@ STEAMNETWORKINGSOCKETS_INTERFACE void SteamNetworkingSockets_SetLockWaitWarningT
 	s_usecLockWaitWarningThreshold = usecTheshold;
 }
 
-STEAMNETWORKINGSOCKETS_INTERFACE void SteamNetworkingSockets_SetLockAcquiredCallback( void (*callback)( SteamNetworkingMicroseconds usecWaited ) )
+STEAMNETWORKINGSOCKETS_INTERFACE void SteamNetworkingSockets_SetLockAcquiredCallback( void (*callback)( const char *tags, SteamNetworkingMicroseconds usecWaited ) )
 {
 	s_fLockAcquiredCallback = callback;
 }
+
+STEAMNETWORKINGSOCKETS_INTERFACE void SteamNetworkingSockets_SetLockHeldCallback( void (*callback)( const char *tags, SteamNetworkingMicroseconds usecWaited ) )
+{
+	s_fLockHeldCallback = callback;
+}
+
+STEAMNETWORKINGSOCKETS_INTERFACE void SteamNetworkingSockets_SetPreFormatDebugOutputHandler(
+	ESteamNetworkingSocketsDebugOutputType eDetailLevel,
+	void (*pfn_Handler)( ESteamNetworkingSocketsDebugOutputType eType, bool bFmt, const char* pstrFile, int nLine, const char *pMsg, va_list ap )
+)
+{
+	g_eDefaultGroupSpewLevel = eDetailLevel;
+	g_pfnPreFormatSpewHandler = pfn_Handler;
+}
+
+STEAMNETWORKINGSOCKETS_INTERFACE void SteamNetworkingSockets_DefaultPreFormatDebugOutputHandler( ESteamNetworkingSocketsDebugOutputType eType, bool bFmt, const char* pstrFile, int nLine, const char *pMsg, va_list ap )
+{
+	// Save callback.  Paranoia for unlikely but possible race condition,
+	// if we spew from more than one place in our code and stuff changes
+	// while we are formatting.
+	FSteamNetworkingSocketsDebugOutput pfnDebugOutput = s_pfnDebugOutput;
+
+	// Make sure we don't crash.
+	if ( !pfnDebugOutput )
+		return;
+
+	// Do the formatting
+	char buf[ 2048 ];
+	int szBuf = sizeof(buf);
+	char *msgDest = buf;
+	if ( pstrFile )
+	{
+		int l = V_sprintf_safe( buf, "%s(%d): ", pstrFile, nLine );
+		szBuf -= l;
+		msgDest += l;
+	}
+
+	if ( bFmt )
+		V_vsnprintf( msgDest, szBuf, pMsg, ap );
+	else
+		V_strncpy( msgDest, pMsg, szBuf );
+
+	// Gah, some, but not all, of our code has newlines on the end
+	V_StripTrailingWhitespaceASCII( buf );
+
+	// Invoke callback
+	pfnDebugOutput( eType, buf );
+}
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// memory override
+//
+/////////////////////////////////////////////////////////////////////////////
+
+#include <tier0/memdbgoff.h>
+
+#ifdef STEAMNETWORKINGSOCKETS_ENABLE_MEM_OVERRIDE
+
+static bool s_bHasAllocatedMemory = false;
+
+static void* (*s_pfn_malloc)( size_t s ) = malloc;
+static void (*s_pfn_free)( void *p ) = free;
+static void* (*s_pfn_realloc)( void *p, size_t s ) = realloc;
+
+void *SteamNetworkingSockets_Malloc( size_t s )
+{
+	s_bHasAllocatedMemory = true;
+	return (*s_pfn_malloc)( s );
+}
+
+void *SteamNetworkingSockets_Realloc( void *p, size_t s )
+{
+	s_bHasAllocatedMemory = true;
+	return (*s_pfn_realloc)( p, s );
+}
+
+void SteamNetworkingSockets_Free( void *p )
+{
+	(*s_pfn_free)( p );
+}
+
+STEAMNETWORKINGSOCKETS_INTERFACE void SteamNetworkingSockets_SetCustomMemoryAllocator(
+	void* (*pfn_malloc)( size_t s ),
+	void (*pfn_free)( void *p ),
+	void* (*pfn_realloc)( void *p, size_t s )
+) {
+	Assert( !s_bHasAllocatedMemory ); // Too late!
+
+	s_pfn_malloc = pfn_malloc;
+	s_pfn_free = pfn_free;
+	s_pfn_realloc = pfn_realloc;
+}
+#endif

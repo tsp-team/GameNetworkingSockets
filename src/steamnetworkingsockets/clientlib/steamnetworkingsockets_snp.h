@@ -11,7 +11,62 @@ struct P2PSessionState_t;
 
 namespace SteamNetworkingSocketsLib {
 
+// Acks may be delayed.  This controls the precision used on the wire to encode the delay time.
+constexpr int k_nAckDelayPrecisionShift = 5;
+constexpr SteamNetworkingMicroseconds k_usecAckDelayPrecision = (1 << k_nAckDelayPrecisionShift );
+
+// When a receiver detects a dropped packet, wait a bit before NACKing it, to give it time
+// to arrive out of order.  This is really important for many different types of connections
+// that send on different channels, e.g. DSL, Wifi.
+// Here we really could be smarter, by tracking how often dropped
+// packets really do arrive out of order.  If the rate is low, then it's
+// probably best to go ahead and send a NACK now, rather than waiting.
+// But if dropped packets do often arrive out of order, then waiting
+// to NACK will probably save some retransmits.  In fact, instead
+// of learning the rate, we should probably try to learn the delay.
+// E.g. a probability distribution P(t), which describes the odds
+// that a dropped packet will have arrived at time t.  Then you
+// adjust the NACK delay such that P(nack_delay) gives the best
+// balance between false positive and false negative rates.
+constexpr SteamNetworkingMicroseconds k_usecNackFlush = 3*1000;
+
+// Max size of a message that we are wiling to *receive*.
+constexpr int k_cbMaxMessageSizeRecv = k_cbMaxSteamNetworkingSocketsMessageSizeSend*2;
+
+// The max we will look ahead and allocate data, ahead of the reliable
+// messages we have been able to decode.  We limit this to make sure that
+// a malicious sender cannot exploit us.
+constexpr int k_cbMaxBufferedReceiveReliableData = k_cbMaxMessageSizeRecv + 64*1024;
+constexpr int k_nMaxReliableStreamGaps_Extend = 30; // Discard reliable data past the end of the stream, if it would cause us to get too many gaps
+constexpr int k_nMaxReliableStreamGaps_Fragment = 20; // Discard reliable data that is filling in the middle of a hole, if it would cause the number of gaps to exceed this number
+constexpr int k_nMaxPacketGaps = 62; // Don't bother tracking more than N gaps.  Instead, we will end up NACKing some packets that we actually did receive.  This should not break the protocol, but it protects us from malicious sender
+
+// Hang on to at most N unreliable segments.  When packets are dropping
+// and unreliable messages being fragmented, we will accumulate old pieces
+// of unreliable messages that we retain in hopes that we will get the
+// missing piece and reassemble the whole message.  At a certain point we
+// must give up and discard them.  We use a simple strategy of just limiting
+// the max total number.  In reality large unreliable messages are just a very bad
+// idea, since the odds of the message dropping increase exponentially with the
+// number of packets.  With 20 packets, even 1% packet loss becomes ~80% message
+// loss.  (Assuming naive fragmentation and reassembly and no forward
+// error correction.)
+constexpr int k_nMaxBufferedUnreliableSegments = 20;
+
+// If app tries to send a message larger than N bytes unreliably,
+// complain about it, and automatically convert to reliable.
+// About 15 segments.
+constexpr int k_cbMaxUnreliableMsgSizeSend = 15*1100;
+
+// Max possible size of an unreliable segment we could receive.
+constexpr int k_cbMaxUnreliableSegmentSizeRecv = k_cbSteamNetworkingSocketsMaxPlaintextPayloadRecv;
+
+// Largest possible total unreliable message we can receive, based on the constraints above
+constexpr int k_cbMaxUnreliableMsgSizeRecv = k_nMaxBufferedUnreliableSegments*k_cbMaxUnreliableSegmentSizeRecv;
+COMPILE_TIME_ASSERT( k_cbMaxUnreliableMsgSizeRecv > k_cbMaxUnreliableMsgSizeSend + 4096 ); // Postel's law; confirm how much slack we have here
+
 class CSteamNetworkConnectionBase;
+class CConnectionTransport;
 struct SteamNetworkingMessageQueue;
 
 /// Actual implementation of SteamNetworkingMessage_t, which is the API
@@ -20,6 +75,7 @@ struct SteamNetworkingMessageQueue;
 class CSteamNetworkingMessage : public SteamNetworkingMessage_t
 {
 public:
+	STEAMNETWORKINGSOCKETS_DECLARE_CLASS_OPERATOR_NEW
 	static CSteamNetworkingMessage *New( CSteamNetworkConnectionBase *pParent, uint32 cbSize, int64 nMsgNum, int nFlags, SteamNetworkingMicroseconds usecNow );
 	static CSteamNetworkingMessage *New( uint32 cbSize );
 	static void DefaultFreeData( SteamNetworkingMessage_t *pMsg );
@@ -152,6 +208,11 @@ struct SNPRange_t
 /// we remove packets from this list.
 struct SNPInFlightPacket_t
 {
+	//
+	// FIXME - Could definitely pack this structure better.  And maybe
+	//         worth it to optimize cache
+	//
+
 	/// Local timestamp when we sent it
 	SteamNetworkingMicroseconds m_usecWhenSent;
 
@@ -159,6 +220,9 @@ struct SNPInFlightPacket_t
 	/// packet as being skipped?  Note that we might subsequently get an
 	/// an ack for this same packet, that's OK!
 	bool m_bNack;
+
+	/// Transport used to send
+	CConnectionTransport *m_pTransport;
 
 	/// List of reliable segments.  Ignoring retransmission,
 	/// there really is no reason why we we would need to have
@@ -322,12 +386,12 @@ struct SSNPSenderState
 	/// List of packets that we have sent but don't know whether they were received or not.
 	/// We keep a dummy sentinel at the head of the list, with a negative packet number.
 	/// This vastly simplifies the processing.
-	std::map<int64,SNPInFlightPacket_t> m_mapInFlightPacketsByPktNum;
+	std_map<int64,SNPInFlightPacket_t> m_mapInFlightPacketsByPktNum;
 
 	/// The next unacked packet that should be timed out and implicitly NACKed,
 	/// if we don't receive an ACK in time.  Will be m_mapInFlightPacketsByPktNum.end()
 	/// if we don't have any in flight packets that we are waiting on.
-	std::map<int64,SNPInFlightPacket_t>::iterator m_itNextInFlightPacketToTimeout;
+	std_map<int64,SNPInFlightPacket_t>::iterator m_itNextInFlightPacketToTimeout;
 
 	/// Ordered list of reliable ranges that we have recently sent
 	/// in a packet.  These should be non-overlapping, and furthermore
@@ -335,11 +399,11 @@ struct SSNPSenderState
 	///
 	/// The "value" portion of the map is the message that has the first bit of
 	/// reliable data we need for this message
-	std::map<SNPRange_t,CSteamNetworkingMessage*,SNPRange_t::NonOverlappingLess> m_listInFlightReliableRange;
+	std_map<SNPRange_t,CSteamNetworkingMessage*,SNPRange_t::NonOverlappingLess> m_listInFlightReliableRange;
 
 	/// Ordered list of ranges that have been put on the wire,
 	/// but have been detected as dropped, and now need to be retried.
-	std::map<SNPRange_t,CSteamNetworkingMessage*,SNPRange_t::NonOverlappingLess> m_listReadyRetryReliableRange;
+	std_map<SNPRange_t,CSteamNetworkingMessage*,SNPRange_t::NonOverlappingLess> m_listReadyRetryReliableRange;
 
 	/// Oldest packet sequence number that we are still asking peer
 	/// to send acks for.
@@ -347,6 +411,18 @@ struct SSNPSenderState
 
 	// Remove messages from m_unackedReliableMessages that have been fully acked.
 	void RemoveAckedReliableMessageFromUnackedList();
+
+	/// Check invariants in debug.
+	#if STEAMNETWORKINGSOCKETS_SNP_PARANOIA == 0 
+		inline void DebugCheckInFlightPacketMap() const {}
+	#else
+		void DebugCheckInFlightPacketMap() const;
+	#endif
+	#if STEAMNETWORKINGSOCKETS_SNP_PARANOIA > 1
+		inline void MaybeCheckInFlightPacketMap() const { DebugCheckInFlightPacketMap(); }
+	#else
+		inline void MaybeCheckInFlightPacketMap() const {}
+	#endif
 };
 
 struct SSNPRecvUnreliableSegmentKey
@@ -366,7 +442,7 @@ struct SSNPRecvUnreliableSegmentData
 {
 	int m_cbSegSize = -1;
 	bool m_bLast = false;
-	char m_buf[ k_cbSteamNetworkingSocketsMaxPlaintextPayloadRecv ];
+	char m_buf[ k_cbMaxUnreliableSegmentSizeRecv ];
 };
 
 struct SSNPPacketGap
@@ -389,7 +465,7 @@ struct SSNPReceiverState
 	/// needs to be fragmented, we store the pieces here.  NOTE: it might be more efficient
 	/// to use a simpler container, with worse O(), since this should ordinarily be
 	/// a pretty small list.
-	std::map<SSNPRecvUnreliableSegmentKey,SSNPRecvUnreliableSegmentData> m_mapUnreliableSegments;
+	std_map<SSNPRecvUnreliableSegmentKey,SSNPRecvUnreliableSegmentData> m_mapUnreliableSegments;
 
 	/// Stream position of the first byte in m_bufReliableData.  Remember that the first byte
 	/// in the reliable stream is actually at position 1, not 0
@@ -402,7 +478,7 @@ struct SSNPReceiverState
 	int64 m_nLastRecvReliableMsgNum = 0;
 
 	/// Reliable data stream that we have received.  This might have gaps in it!
-	std::vector<byte> m_bufReliableStream;
+	std_vector<byte> m_bufReliableStream;
 
 	/// Gaps in the reliable data.  These are created when we receive reliable data that
 	/// is beyond what we expect next.  Since these must never overlap, we store them
@@ -411,7 +487,7 @@ struct SSNPReceiverState
 	/// !SPEED! We should probably use a small fixed-sized, sorted vector here,
 	/// since in most cases the list will be small, and the cost of dynamic memory
 	/// allocation will be way worse than O(n) insertion/removal.
-	std::map<int64,int64> m_mapReliableStreamGaps;
+	std_map<int64,int64> m_mapReliableStreamGaps;
 
 	/// List of gaps in the packet sequence numbers we have received.
 	/// Since these must never overlap, we store them using begin as the
@@ -428,7 +504,7 @@ struct SSNPReceiverState
 	/// !SPEED! We should probably use a small fixed-sized, sorted vector here,
 	/// since in most cases the list will be small, and the cost of dynamic memory
 	/// allocation will be way worse than O(n) insertion/removal.
-	std::map<int64,SSNPPacketGap> m_mapPacketGaps;
+	std_map<int64,SSNPPacketGap> m_mapPacketGaps;
 
 	/// Oldest packet sequence number we need to ack to our peer
 	int64 m_nMinPktNumToSendAcks = 0;
@@ -439,7 +515,7 @@ struct SSNPReceiverState
 	/// The next ack that needs to be sent.  The invariant
 	/// for the times are:
 	///
-	/// * Blocks with lower pakcet numbers: m_usecWhenAckPrior = INT64_MAX
+	/// * Blocks with lower packet numbers: m_usecWhenAckPrior = INT64_MAX
 	/// * This block: m_usecWhenAckPrior < INT64_MAX, or we are the sentinel
 	/// * Blocks with higher packet numbers (if we are not the sentinel): m_usecWhenAckPrior >= previous m_usecWhenAckPrior
 	///
@@ -450,20 +526,20 @@ struct SSNPReceiverState
 	/// many as will fit.  The one exception is that if
 	/// sending an ack would imply a NACK that we don't want to
 	/// send yet.  (Remember the restrictions on what we are able
-	/// to commununicate due to the tight RLE encoding of the wire
+	/// to communicate due to the tight RLE encoding of the wire
 	/// format.)  These delays are usually very short lived, and
 	/// only happen when there is packet loss, so they don't delay
 	/// acks very much.  The whole purpose of this rather involved
 	/// bookkeeping is to figure out which acks we *need* to send,
 	/// and which acks we cannot send yet, so we can make optimal
 	/// decisions.
-	std::map<int64,SSNPPacketGap>::iterator m_itPendingAck;
+	std_map<int64,SSNPPacketGap>::iterator m_itPendingAck;
 
 	/// Iterator into m_mapPacketGaps.  If != the sentinel,
 	/// we will avoid reporting on the dropped packets in this
 	/// gap (and all higher numbered packets), because we are
 	/// waiting in the hopes that they will arrive out of order.
-	std::map<int64,SSNPPacketGap>::iterator m_itPendingNack;
+	std_map<int64,SSNPPacketGap>::iterator m_itPendingNack;
 
 	/// Queue a flush of ALL acks (and NACKs!) by the given time.
 	/// If anything is scheduled to happen earlier, that schedule
@@ -486,7 +562,7 @@ struct SSNPReceiverState
 	}
 
 	/// Check invariants in debug.
-	#ifdef _DEBUG
+	#if STEAMNETWORKINGSOCKETS_SNP_PARANOIA > 1
 		void DebugCheckPackGapMap() const;
 	#else
 		inline void DebugCheckPackGapMap() const {}

@@ -26,6 +26,17 @@ def docker_arch(travis_arch):
         return 'arm64v8'
     return travis_arch
 
+def image_name(image, tag, arch):
+    # e.g. ubuntu:latest
+    image = '%s:%s' % (image, tag)
+
+    if arch != 'amd64':
+        image_prefix = docker_arch(arch) + '/'
+        os.environ['IMAGE_PREFIX'] = image_prefix
+        return image_prefix + image
+
+    return image
+
 def env_parse(env, arch):
     kv_str = env.split()
     kv = { k: v for k, v in [ s.split('=') for s in kv_str ] }
@@ -49,29 +60,36 @@ def env_parse(env, arch):
     if options['--image-tag'] != 'any' and kv['IMAGE_TAG'] != options['--image-tag']:
         return None
 
-    # e.g. ubuntu:latest
-    image = '%s:%s' % (kv['IMAGE'], kv['IMAGE_TAG'])
-
-    if arch != 'amd64':
-        image_prefix = docker_arch(arch) + '/'
-        os.environ['IMAGE_PREFIX'] = image_prefix
-        return image_prefix + image
-
-    return image
+    return image_name(kv['IMAGE'], kv['IMAGE_TAG'], arch)
 
 def get_images(travis):
+    match_found = False
+
     for env in travis['env']['global']:
         env_parse(env, travis['arch'])
 
     for env in travis['env']['jobs']:
         image = env_parse(env, travis['arch'])
         if image is not None:
+            match_found = True
             yield image
 
     for job in travis['jobs']['include']:
         image = env_parse(job['env'], job['arch'])
         if image is not None:
+            match_found = True
             yield image
+
+    # If we didn't find a match with our constraints, maybe the user wanted to
+    # test a specific image not listed in .travis.yml.
+    if not match_found:
+        if 'any' not in [options['--image'], options['--image-tag'], options['--arch']]:
+            image = env_parse(
+                'IMAGE=%s IMAGE_TAG=%s' % (options['--image'], options['--image-tag']),
+                options['--arch']
+            )
+            if image is not None:
+                yield image
 
 def docker_pull(image):
     subprocess.run(['docker', 'pull', image], check=True)
@@ -123,17 +141,24 @@ def main():
 
     options = docopt(__doc__)
 
+    # We do a shallow "git submodule update --init" in a real travis build, but
+    # that's not useful for local development purposes. We should do a real
+    # update before a container can make shallow clones.
+    log.info("Updating submodules")
+    subprocess.run(['git', 'submodule', 'update', '--init'])
+
     log.info("Parsing Travis configuration file")
     travis = read_travis_yml()
 
     # Pull the images down first
     log.info("Pulling Docker images")
-    docker_pull('multiarch/qemu-user-static')
+    docker_pull('aptman/qus')
     pull_images(travis)
 
     # Initialize system environment
     log.info("Preparing system to run foreign architecture containers")
-    subprocess.run(['docker', 'run', '--rm', '--privileged', 'multiarch/qemu-user-static', '--reset', '-p', 'yes'], check=True)
+    subprocess.run(['docker', 'run', '--rm', '--privileged', 'aptman/qus', '-s', '--', '-r'], check=True)
+    subprocess.run(['docker', 'run', '--rm', '--privileged', 'aptman/qus', '-s', '--', '-p'], check=True)
 
     # Run native tests first
     kill_and_wait()

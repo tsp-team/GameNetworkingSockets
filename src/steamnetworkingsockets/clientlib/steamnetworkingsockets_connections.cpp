@@ -39,16 +39,6 @@ bool BCheckGlobalSpamReplyRateLimit( SteamNetworkingMicroseconds usecNow )
 	return true;
 }
 
-/// Replace internal states that are not visible outside of the API with
-/// the corresponding state that we show the the application.
-inline ESteamNetworkingConnectionState CollapseConnectionStateToAPIState( ESteamNetworkingConnectionState eState )
-{
-	// All the hidden internal states are assigned negative values
-	if ( eState < 0 )
-		return k_ESteamNetworkingConnectionState_None;
-	return eState;
-}
-
 // Hack code used to generate C++ code to add a new CA key to the table above
 //void KludgePrintPublicKey()
 //{
@@ -486,6 +476,18 @@ bool CSteamNetworkListenSocketBase::BInitListenSocketCommon( int nOptions, const
 		return false;
 	}
 
+	// Check if symmetric is enabled, then make sure it's supported.
+	// It cannot be changed after listen socket creation
+	m_connectionConfig.m_SymmetricConnect.Lock();
+	if ( BSymmetricMode() )
+	{
+		if ( !BSupportsSymmetricMode() )
+		{
+			V_strcpy_safe( errMsg, "Symmetric mode not supported" );
+			return false;
+		}
+	}
+
 	// OK
 	return true;
 }
@@ -512,6 +514,11 @@ void CSteamNetworkListenSocketBase::Destroy()
 bool CSteamNetworkListenSocketBase::APIGetAddress( SteamNetworkingIPAddr *pAddress )
 {
 	// Base class doesn't know
+	return false;
+}
+
+bool CSteamNetworkListenSocketBase::BSupportsSymmetricMode()
+{
 	return false;
 }
 
@@ -597,9 +604,9 @@ CSteamNetworkConnectionBase::CSteamNetworkConnectionBase( CSteamNetworkingSocket
 : m_pSteamNetworkingSocketsInterface( pSteamNetworkingSocketsInterface )
 {
 	m_hConnectionSelf = k_HSteamNetConnection_Invalid;
-	//m_nVirtualPort = -1;
 	m_nUserData = -1;
 	m_eConnectionState = k_ESteamNetworkingConnectionState_None;
+	m_eConnectionWireState = k_ESteamNetworkingConnectionState_None;
 	m_usecWhenEnteredConnectionState = 0;
 	m_usecWhenSentConnectRequest = 0;
 	m_ulHandshakeRemoteTimestamp = 0;
@@ -613,8 +620,6 @@ CSteamNetworkConnectionBase::CSteamNetworkConnectionBase( CSteamNetworkingSocket
 	m_pParentListenSocket = nullptr;
 	m_pPollGroup = nullptr;
 	m_hSelfInParentListenSocketMap = -1;
-	m_pMessagesInterface = nullptr;
-	m_pMessagesSession = nullptr;
 	m_bCertHasIdentity = false;
 	m_bCryptKeysValid = false;
 	m_eNegotiatedCipher = k_ESteamNetworkingSocketsCipher_INVALID;
@@ -622,7 +627,7 @@ CSteamNetworkConnectionBase::CSteamNetworkConnectionBase( CSteamNetworkingSocket
 	memset( m_szDescription, 0, sizeof( m_szDescription ) );
 	m_bConnectionInitiatedRemotely = false;
 	m_pTransport = nullptr;
-	m_bSupressStateChangeCallbacks = false;
+	m_nSupressStateChangeCallbacks = 0;
  
 	// Initialize configuration using parent interface for now.
 	m_connectionConfig.Init( &m_pSteamNetworkingSocketsInterface->m_connectionConfig );
@@ -632,9 +637,9 @@ CSteamNetworkConnectionBase::~CSteamNetworkConnectionBase()
 {
 	Assert( m_hConnectionSelf == k_HSteamNetConnection_Invalid );
 	Assert( m_eConnectionState == k_ESteamNetworkingConnectionState_Dead );
+	Assert( m_eConnectionWireState == k_ESteamNetworkingConnectionState_Dead );
 	Assert( m_queueRecvMessages.empty() );
 	Assert( m_pParentListenSocket == nullptr );
-	Assert( m_pMessagesSession == nullptr );
 }
 
 void CSteamNetworkConnectionBase::ConnectionDestroySelfNow()
@@ -674,9 +679,6 @@ void CSteamNetworkConnectionBase::FreeResources()
 	// API-visible state, this will queue the state change notification
 	// while we still know who our listen socket is (if any).
 	SetState( k_ESteamNetworkingConnectionState_Dead, SteamNetworkingSockets_GetLocalTimestamp() );
-
-	// We should be detatched from any mesages session!
-	Assert( m_pMessagesSession == nullptr );
 
 	// Discard any messages that weren't retrieved
 	m_queueRecvMessages.PurgeMessages();
@@ -839,6 +841,9 @@ void CSteamNetworkConnectionBase::SetPollGroup( CSteamNetworkPollGroup *pPollGro
 
 bool CSteamNetworkConnectionBase::BInitConnection( SteamNetworkingMicroseconds usecNow, int nOptions, const SteamNetworkingConfigValue_t *pOptions, SteamDatagramErrMsg &errMsg )
 {
+	// Should only be called while we are in the initial state
+	Assert( GetState() == k_ESteamNetworkingConnectionState_None );
+
 	// Make sure MTU values are initialized
 	UpdateMTUFromConfig();
 
@@ -933,16 +938,24 @@ bool CSteamNetworkConnectionBase::BInitConnection( SteamNetworkingMicroseconds u
 	// Clear everything out
 	ClearCrypto();
 
-	// Switch connection state, queue state change notifications.
-	SetState( k_ESteamNetworkingConnectionState_Connecting, usecNow );
+	// We should still be in the initial state
+	Assert( GetState() == k_ESteamNetworkingConnectionState_None );
 
 	// Take action to start obtaining a cert, or if we already have one, then set it now
 	InitConnectionCrypto( usecNow );
-
-	// Queue us to think ASAP.
-	SetNextThinkTime( usecNow );
+	if ( GetState() != k_ESteamNetworkingConnectionState_None )
+	{
+		Assert( GetState() == k_ESteamNetworkingConnectionState_ProblemDetectedLocally );
+		V_sprintf_safe( errMsg, "Crypto init error.  %s", m_szEndDebug );
+		return false;
+	}
 
 	return true;
+}
+
+bool CSteamNetworkConnectionBase::BSupportsSymmetricMode()
+{
+	return false;
 }
 
 void CSteamNetworkConnectionBase::SetAppName( const char *pszName )
@@ -971,16 +984,19 @@ void CSteamNetworkConnectionBase::InitConnectionCrypto( SteamNetworkingMicroseco
 
 void CSteamNetworkConnectionBase::ClearCrypto()
 {
-	m_eNegotiatedCipher = k_ESteamNetworkingSocketsCipher_INVALID;
-	m_keyPrivate.Wipe();
 	m_msgCertRemote.Clear();
 	m_msgCryptRemote.Clear();
+	m_bCertHasIdentity = false;
+	m_keyPrivate.Wipe();
+	ClearLocalCrypto();
+}
 
+void CSteamNetworkConnectionBase::ClearLocalCrypto()
+{
+	m_eNegotiatedCipher = k_ESteamNetworkingSocketsCipher_INVALID;
 	m_keyExchangePrivateKeyLocal.Wipe();
 	m_msgCryptLocal.Clear();
 	m_msgSignedCryptLocal.Clear();
-
-	m_bCertHasIdentity = false;
 	m_bCryptKeysValid = false;
 	m_cryptContextSend.Wipe();
 	m_cryptContextRecv.Wipe();
@@ -988,24 +1004,23 @@ void CSteamNetworkConnectionBase::ClearCrypto()
 	m_cryptIVRecv.Wipe();
 }
 
-bool CSteamNetworkConnectionBase::RecvNonDataSequencedPacket( int64 nPktNum, SteamNetworkingMicroseconds usecNow )
+void CSteamNetworkConnectionBase::RecvNonDataSequencedPacket( int64 nPktNum, SteamNetworkingMicroseconds usecNow )
 {
+	// Note: order of operations is important betwen these two calls
 
-	// Let SNP know when we received it, so we can track loss events and send acks
-	if ( SNP_RecordReceivedPktNum( nPktNum, usecNow, false ) )
-	{
+	// Let SNP know when we received it, so we can track loss events and send acks.  We do
+	// not schedule acks to be sent at this time, but when they are sent, we will implicitly
+	// ack this one
+	SNP_RecordReceivedPktNum( nPktNum, usecNow, false );
 
-		// And also the general purpose sequence number/stats tracker
-		// for the end-to-end flow.
-		m_statsEndToEnd.TrackProcessSequencedPacket( nPktNum, usecNow, 0 );
-	}
-
-	return true;
+	// Update general sequence number/stats tracker for the end-to-end flow.
+	m_statsEndToEnd.TrackProcessSequencedPacket( nPktNum, usecNow, 0 );
 }
 
 bool CSteamNetworkConnectionBase::BThinkCryptoReady( SteamNetworkingMicroseconds usecNow )
 {
-	Assert( GetState() == k_ESteamNetworkingConnectionState_Connecting );
+	// Should only be called from initial states
+	Assert( GetState() == k_ESteamNetworkingConnectionState_None || GetState() == k_ESteamNetworkingConnectionState_Connecting );
 
 	// Do we already have a cert?
 	if ( m_msgSignedCertLocal.has_cert() )
@@ -1020,11 +1035,62 @@ bool CSteamNetworkConnectionBase::BThinkCryptoReady( SteamNetworkingMicroseconds
 		return true;
 	}
 
-	// Already have a a signed cert?
-	if ( m_pSteamNetworkingSocketsInterface->m_msgSignedCert.has_ca_signature() )
+	// Check for fetching a cert, if a previous cert attempt failed,
+	// or the cert we have is old
+	#ifdef STEAMNETWORKINGSOCKETS_CAN_REQUEST_CERT
+		if ( AllowLocalUnsignedCert() != k_EUnsignedCert_Allow )
+		{
+
+			// Make sure request is in flight if needed
+			// If this fails (either immediately, or asynchronously), we will
+			// get a CertFailed call with the appropriate code, and we can decide
+			// what we want to do.
+			m_pSteamNetworkingSocketsInterface->CheckAuthenticationPrerequisites( usecNow );
+
+			// Handle synchronous failure.
+			if ( GetState() != k_ESteamNetworkingConnectionState_None && GetState() != k_ESteamNetworkingConnectionState_Connecting )
+				return false;
+
+			// If fetching of cert or trusted cert list in flight, then wait for that to finish
+			SteamNetAuthenticationStatus_t authStatus;
+			m_pSteamNetworkingSocketsInterface->GetAuthenticationStatus( &authStatus );
+			switch ( authStatus.m_eAvail )
+			{
+				case k_ESteamNetworkingAvailability_CannotTry:
+				case k_ESteamNetworkingAvailability_Failed:
+				case k_ESteamNetworkingAvailability_Previously:
+				case k_ESteamNetworkingAvailability_NeverTried:
+				default:
+					AssertMsg2( false, "Unexpected auth avail %d (%s)", authStatus.m_eAvail, authStatus.m_debugMsg );
+					break;
+
+				case k_ESteamNetworkingAvailability_Retrying:
+				case k_ESteamNetworkingAvailability_Waiting:
+				case k_ESteamNetworkingAvailability_Attempting:
+					// Keep waiting
+					return false;
+
+				case k_ESteamNetworkingAvailability_Current:
+					break;
+			}
+
+		}
+	#endif
+
+	// Already have a signed cert?
+	int nSecondsUntilCertExpiry = m_pSteamNetworkingSocketsInterface->GetSecondsUntilCertExpiry();
+	if ( nSecondsUntilCertExpiry > 0 )
 	{
 
+		// We do have a cert -- but if it's close to expiring, wait for any active fetch to finish,
+		// because there's a good chance that our peer will reject it.  (We usually refresh our certs
+		// well ahead of time, so we really should never hit this.)  Note that if this request
+		// fails, we will get a callback, and an opportunity to attempt to proceed with an unsigned cert
+		if ( nSecondsUntilCertExpiry < 300 && m_pSteamNetworkingSocketsInterface->BCertRequestInFlight() )
+			return false;
+
 		// Use it!
+		SpewVerbose( "[%s] Our cert expires in %d seconds.\n", GetDescription(), nSecondsUntilCertExpiry );
 		SetLocalCert( m_pSteamNetworkingSocketsInterface->m_msgSignedCert, m_pSteamNetworkingSocketsInterface->m_keyPrivateKey, m_pSteamNetworkingSocketsInterface->BCertHasIdentity() );
 		return true;
 	}
@@ -1036,15 +1102,10 @@ bool CSteamNetworkConnectionBase::BThinkCryptoReady( SteamNetworkingMicroseconds
 		return true;
 	}
 
-	// Otherwise, we don't have a signed cert (yet?).  Try (again?) to get one.
-	// If this fails (either immediately, or asynchronously), we will
-	// get a CertFailed call with the appropriate code, and we can decide
-	// what we want to do.
-	#ifdef STEAMNETWORKINGSOCKETS_OPENSOURCE
+	// Otherwise, we don't have a signed cert (yet?).
+	#ifndef STEAMNETWORKINGSOCKETS_CAN_REQUEST_CERT
 		ConnectionState_ProblemDetectedLocally( k_ESteamNetConnectionEnd_Misc_InternalError, "Need a cert authority!" );
 		Assert( false );
-	#else
-		m_pSteamNetworkingSocketsInterface->AsyncCertRequest();
 	#endif
 	return false;
 }
@@ -1091,7 +1152,9 @@ void CSteamNetworkConnectionBase::SetCryptoCipherList()
 {
 	Assert( m_msgCryptLocal.ciphers_size() == 0 ); // Should only do this once
 
-	// Select the ciphers we want to use, in preference order
+	// Select the ciphers we want to use, in preference order.
+	// Also, lock it, we cannot change it any more
+	m_connectionConfig.m_Unencrypted.Lock();
 	int unencrypted = m_connectionConfig.m_Unencrypted.Get();
 	switch ( unencrypted )
 	{
@@ -1124,10 +1187,11 @@ void CSteamNetworkConnectionBase::SetCryptoCipherList()
 
 void CSteamNetworkConnectionBase::FinalizeLocalCrypto()
 {
+	// Make sure we have what we need
 	Assert( m_msgCryptLocal.ciphers_size() > 0 );
+	Assert( m_keyPrivate.IsValid() );
 
 	// Should only do this once
-	Assert( m_keyPrivate.IsValid() );
 	Assert( !m_msgSignedCryptLocal.has_info() );
 
 	// Set protocol version
@@ -1150,7 +1214,8 @@ void CSteamNetworkConnectionBase::FinalizeLocalCrypto()
 	m_keyPrivate.GenerateSignature( m_msgSignedCryptLocal.info().c_str(), m_msgSignedCryptLocal.info().length(), &sig );
 	m_msgSignedCryptLocal.set_signature( &sig, sizeof(sig) );
 
-	m_keyPrivate.Wipe();
+	// Note: In certain circumstances, we may need to do this again, so don't wipte the key just yet
+	//m_keyPrivate.Wipe();
 }
 
 void CSteamNetworkConnectionBase::SetLocalCertUnsigned()
@@ -1183,7 +1248,7 @@ void CSteamNetworkConnectionBase::CertRequestFailed( ESteamNetConnectionEnd nCon
 {
 
 	// Make sure we care about this
-	if ( GetState() != k_ESteamNetworkingConnectionState_Connecting )
+	if ( GetState() != k_ESteamNetworkingConnectionState_Connecting && GetState() != k_ESteamNetworkingConnectionState_None )
 		return;
 	if ( BHasLocalCert() )
 		return;
@@ -1347,6 +1412,19 @@ bool CSteamNetworkConnectionBase::BRecvCryptoHandshake( const CMsgSteamDatagramC
 	}
 	m_statsEndToEnd.m_nPeerProtocolVersion = m_msgCryptRemote.protocol_version();
 
+	// Starting with protocol 10, the connect request/OK packets always implicitly
+	// have a packet number of 1, and thus the next packet (often the first data packet)
+	// is assigned a sequence number of 2, at a minimum.
+	Assert( m_statsEndToEnd.m_nNextSendSequenceNumber >= 1 );
+	Assert( m_statsEndToEnd.m_nMaxRecvPktNum >= 0 );
+	if ( m_statsEndToEnd.m_nPeerProtocolVersion >= 10 )
+	{
+		if ( m_statsEndToEnd.m_nNextSendSequenceNumber == 1 )
+			m_statsEndToEnd.m_nNextSendSequenceNumber = 2;
+		if ( m_statsEndToEnd.m_nMaxRecvPktNum == 0 )
+			m_statsEndToEnd.InitMaxRecvPktNum( 1 );
+	}
+
 	// Check for legacy client that didn't send a list of ciphers
 	if ( m_msgCryptRemote.ciphers_size() == 0 )
 		m_msgCryptRemote.add_ciphers( k_ESteamNetworkingSocketsCipher_AES_256_GCM );
@@ -1430,6 +1508,10 @@ bool CSteamNetworkConnectionBase::BFinishCryptoHandshake( bool bServer )
 		FinalizeLocalCrypto();
 	}
 	Assert( m_msgSignedCryptLocal.has_info() );
+
+	// At this point, we know that we will never the private key again.  So let's
+	// wipe it now, to minimize the number of copies of this hanging around in memory.
+	m_keyPrivate.Wipe();
 
 	// Key exchange public key
 	CECKeyExchangePublicKey keyExchangePublicKeyRemote;
@@ -1560,15 +1642,22 @@ bool CSteamNetworkConnectionBase::BFinishCryptoHandshake( bool bServer )
 
 EUnsignedCert CSteamNetworkConnectionBase::AllowLocalUnsignedCert()
 {
-	// FIXME - We should probably lock this down and change the default.
-	//         For now we'll try to continue, but warn
-	return k_EUnsignedCert_AllowWarn;
+	#ifdef STEAMNETWORKINGSOCKETS_OPENSOURCE
+		// We don't have a cert authority.  We probably ought to make this customizable
+		return k_EUnsignedCert_Allow;
+	#else
+		return k_EUnsignedCert_Disallow;
+	#endif
 }
 
 EUnsignedCert CSteamNetworkConnectionBase::AllowRemoteUnsignedCert()
 {
-	// !KLUDGE! For now, assume this is OK, but warn about it.  We need to make this configurable and lock it down
-	return k_EUnsignedCert_AllowWarn;
+	#ifdef STEAMNETWORKINGSOCKETS_OPENSOURCE
+		// We don't have a cert authority.  We probably ought to make this customizable
+		return k_EUnsignedCert_Allow;
+	#else
+		return k_EUnsignedCert_Disallow;
+	#endif
 }
 
 ESteamNetConnectionEnd CSteamNetworkConnectionBase::CheckRemoteCert( const CertAuthScope *pCACertAuthScope, SteamNetworkingErrMsg &errMsg )
@@ -1841,35 +1930,43 @@ int CSteamNetworkConnectionBase::APIReceiveMessages( SteamNetworkingMessage_t **
 	return m_queueRecvMessages.RemoveMessages( ppOutMessages, nMaxMessages );
 }
 
-int64 CSteamNetworkConnectionBase::DecryptDataChunk( uint16 nWireSeqNum, int cbPacketSize, const void *pChunk, int cbChunk, void *&pDecrypted, uint32 &cbDecrypted, SteamNetworkingMicroseconds usecNow )
+bool CSteamNetworkConnectionBase::DecryptDataChunk( uint16 nWireSeqNum, int cbPacketSize, const void *pChunk, int cbChunk, RecvPacketContext_t &ctx )
 {
-	Assert( m_bCryptKeysValid );
-	Assert( cbDecrypted >= k_cbSteamNetworkingSocketsMaxPlaintextPayloadRecv );
+	if ( !m_bCryptKeysValid || !BStateIsActive() )
+	{
+		Assert( m_bCryptKeysValid );
+		Assert( BStateIsActive() );
+		return false;
+	}
 
-	// Track flow, even if we end up discarding this
-	m_statsEndToEnd.TrackRecvPacket( cbPacketSize, usecNow );
+	// Sequence number should be initialized at this point!  We had some cases where
+	// the protocol was not properly assigning a sequence number, but those should be
+	// fixed now
+	AssertMsg1( m_statsEndToEnd.m_nMaxRecvPktNum > 0 || m_statsEndToEnd.m_nPeerProtocolVersion < 10, "[%s] packet number not properly initialized!", GetDescription() );
 
 	// Get the full end-to-end packet number, check if we should process it
-	// FIXME This is firing.  Should enable it and fix it.  but things were working before, and I
-	// don't want to freak people out with asserts that are probably harmless
-	//Assert( m_statsEndToEnd.m_nMaxRecvPktNum > 0 );
-	int64 nFullSequenceNumber = m_statsEndToEnd.ExpandWirePacketNumberAndCheck( nWireSeqNum );
-	if ( nFullSequenceNumber <= 0 )
-		return 0;
+	ctx.m_nPktNum = m_statsEndToEnd.ExpandWirePacketNumberAndCheck( nWireSeqNum );
+	if ( ctx.m_nPktNum <= 0 )
+	{
+
+		// Update raw packet counters numbers, but do not update any logical state suc as reply timeouts, etc
+		m_statsEndToEnd.m_recv.ProcessPacket( cbPacketSize );
+		return false;
+	}
 
 	// What cipher are we using?
 	switch ( m_eNegotiatedCipher )
 	{
 		default:
 			AssertMsg1( false, "Bogus cipher %d", m_eNegotiatedCipher );
-			return 0;
+			return false;
 
 		case k_ESteamNetworkingSocketsCipher_NULL:
 		{
 
 			// No encryption!
-			cbDecrypted = cbChunk;
-			pDecrypted = const_cast<void*>( pChunk );
+			ctx.m_cbPlainText = cbChunk;
+			ctx.m_pPlainText = pChunk;
 		}
 		break;
 
@@ -1877,7 +1974,7 @@ int64 CSteamNetworkConnectionBase::DecryptDataChunk( uint16 nWireSeqNum, int cbP
 		{
 
 			// Adjust the IV by the packet number
-			*(uint64 *)&m_cryptIVRecv.m_buf += LittleQWord( nFullSequenceNumber );
+			*(uint64 *)&m_cryptIVRecv.m_buf += LittleQWord( ctx.m_nPktNum );
 			//SpewMsg( "Recv decrypt IV %llu + %02x%02x%02x%02x  encrypted %d %02x%02x%02x%02x\n",
 			//	*(uint64 *)&m_cryptIVRecv.m_buf,
 			//	m_cryptIVRecv.m_buf[8], m_cryptIVRecv.m_buf[9], m_cryptIVRecv.m_buf[10], m_cryptIVRecv.m_buf[11],
@@ -1886,15 +1983,16 @@ int64 CSteamNetworkConnectionBase::DecryptDataChunk( uint16 nWireSeqNum, int cbP
 			//);
 
 			// Decrypt the chunk and check the auth tag
+			uint32 cbDecrypted = sizeof(ctx.m_decrypted);
 			bool bDecryptOK = m_cryptContextRecv.Decrypt(
 				pChunk, cbChunk, // encrypted
 				m_cryptIVRecv.m_buf, // IV
-				pDecrypted, &cbDecrypted, // output
+				ctx.m_decrypted, &cbDecrypted, // output
 				nullptr, 0 // no AAD
 			);
 
 			// Restore the IV to the base value
-			*(uint64 *)&m_cryptIVRecv.m_buf -= LittleQWord( nFullSequenceNumber );
+			*(uint64 *)&m_cryptIVRecv.m_buf -= LittleQWord( ctx.m_nPktNum );
 	
 			// Did decryption fail?
 			if ( !bDecryptOK ) {
@@ -1903,9 +2001,15 @@ int64 CSteamNetworkConnectionBase::DecryptDataChunk( uint16 nWireSeqNum, int cbP
 				// The assumption is that we either have a bug or some weird thing,
 				// or that somebody is spoofing / tampering.  If it's the latter
 				// we don't want to magnify the impact of their efforts
-				SpewWarningRateLimited( usecNow, "[%s] Packet data chunk failed to decrypt!  Could be tampering/spoofing or a bug.", GetDescription() );
-				return 0;
+				SpewWarningRateLimited( ctx.m_usecNow, "[%s] Packet data chunk failed to decrypt!  Could be tampering/spoofing or a bug.", GetDescription() );
+
+				// Update raw packet counters numbers, but do not update any logical state suc as reply timeouts, etc
+				m_statsEndToEnd.m_recv.ProcessPacket( cbPacketSize );
+				return false;
 			}
+
+			ctx.m_cbPlainText = (int)cbDecrypted;
+			ctx.m_pPlainText = ctx.m_decrypted;
 
 			//SpewVerbose( "Connection %u recv seqnum %lld (gap=%d) sz=%d %02x %02x %02x %02x\n", m_unConnectionID, unFullSequenceNumber, nGap, cbDecrypted, arDecryptedChunk[0], arDecryptedChunk[1], arDecryptedChunk[2], arDecryptedChunk[3] );
 		}
@@ -1927,32 +2031,17 @@ int64 CSteamNetworkConnectionBase::DecryptDataChunk( uint16 nWireSeqNum, int cbP
 	// with a lower rate.  If the app is really trying to fill the pipe and blasting a large
 	// amount of data (and not forcing us to send small packets), then our code should be sending
 	// mostly full packets, which means that this is closer to a gap of around ~18MB.
-	int64 nGap = nFullSequenceNumber - m_statsEndToEnd.m_nMaxRecvPktNum;
+	int64 nGap = ctx.m_nPktNum - m_statsEndToEnd.m_nMaxRecvPktNum;
 	if ( nGap > 0x4000 )
 	{
 		ConnectionState_ProblemDetectedLocally( k_ESteamNetConnectionEnd_Misc_Generic,
 			"Pkt number lurch by %lld; %04x->%04x",
 			(long long)nGap, (uint16)m_statsEndToEnd.m_nMaxRecvPktNum, nWireSeqNum);
-		return 0;
-	}
-
-	// Decrypted ok
-	return nFullSequenceNumber;
-}
-
-bool CSteamNetworkConnectionBase::ProcessPlainTextDataChunk( int64 nFullSequenceNumber, const void *pDecrypted, uint32 cbDecrypted, int usecTimeSinceLast, SteamNetworkingMicroseconds usecNow )
-{
-
-	// Pass on to reassembly/reliability layer.  It may instruct us to act like we never received this
-	// packet
-	if ( !SNP_RecvDataChunk( nFullSequenceNumber, pDecrypted, cbDecrypted, usecNow ) )
-	{
-		SpewDebug( "[%s] discarding pkt %lld\n", GetDescription(), (long long)nFullSequenceNumber );
 		return false;
 	}
 
-	// Packet is OK.  Track end-to-end flow.
-	m_statsEndToEnd.TrackProcessSequencedPacket( nFullSequenceNumber, usecNow, usecTimeSinceLast );
+	// Decrypted ok.  Track flow, and allow this packet to update the logical state, reply timeouts, etc
+	m_statsEndToEnd.TrackRecvPacket( cbPacketSize, ctx.m_usecNow );
 	return true;
 }
 
@@ -1964,6 +2053,11 @@ EResult CSteamNetworkConnectionBase::APIAcceptConnection()
 		if ( GetState() == k_ESteamNetworkingConnectionState_ClosedByPeer )
 		{
 			SpewWarning( "[%s] Cannot accept connection; already closed by remote host.", GetDescription() );
+		}
+		else if ( BSymmetricMode() && BStateIsActive() )
+		{
+			SpewMsg( "[%s] Symmetric connection has already been accepted (perhaps implicitly, by attempting matching outbound connection)", GetDescription() );
+			return k_EResultDuplicateRequest;
 		}
 		else
 		{
@@ -2087,49 +2181,113 @@ void CSteamNetworkConnectionBase::SetState( ESteamNetworkingConnectionState eNew
 {
 	if ( eNewState == m_eConnectionState )
 		return;
-	ESteamNetworkingConnectionState eOldState = m_eConnectionState;
+	const ESteamNetworkingConnectionState eOldState = m_eConnectionState;
 	m_eConnectionState = eNewState;
 
 	// Remember when we entered this state
 	m_usecWhenEnteredConnectionState = usecNow;
 
-	// Post a notification when certain state changes occur.  Note that
-	// "internal" state changes, where the connection is effectively closed
-	// from the application's perspective, are not relevant
-	ESteamNetworkingConnectionState eOldAPIState = CollapseConnectionStateToAPIState( eOldState );
-	ESteamNetworkingConnectionState eNewAPIState = CollapseConnectionStateToAPIState( GetState() );
-
-	// Internal connection used by the higher-level messages interface?
-	if ( !m_bSupressStateChangeCallbacks )
+	// Set wire state
+	switch ( GetState() )
 	{
-		if ( m_pMessagesInterface )
+		default:
+			Assert( false );
+			// FALLTHROUGH
+
+		case k_ESteamNetworkingConnectionState_Dead:
+		case k_ESteamNetworkingConnectionState_None:
+		case k_ESteamNetworkingConnectionState_Connected:
+		case k_ESteamNetworkingConnectionState_FindingRoute:
+		case k_ESteamNetworkingConnectionState_Connecting:
+		case k_ESteamNetworkingConnectionState_ProblemDetectedLocally:
+		case k_ESteamNetworkingConnectionState_ClosedByPeer:
+			m_eConnectionWireState = eNewState;
+			break;
+
+		case k_ESteamNetworkingConnectionState_FinWait:
+
+			// Check where we are coming from
+			switch ( eOldState )
+			{
+				case k_ESteamNetworkingConnectionState_Dead:
+				case k_ESteamNetworkingConnectionState_None:
+				case k_ESteamNetworkingConnectionState_FinWait:
+				default:
+					Assert( false );
+					break;
+
+				case k_ESteamNetworkingConnectionState_ClosedByPeer:
+				case k_ESteamNetworkingConnectionState_ProblemDetectedLocally:
+					Assert( m_eConnectionWireState == eOldState );
+					m_eConnectionWireState = eOldState;
+					break;
+
+				case k_ESteamNetworkingConnectionState_Linger:
+				case k_ESteamNetworkingConnectionState_Connecting:
+				case k_ESteamNetworkingConnectionState_FindingRoute:
+				case k_ESteamNetworkingConnectionState_Connected:
+					m_eConnectionWireState = k_ESteamNetworkingConnectionState_FinWait;
+					break;
+			}
+			break;
+
+		case k_ESteamNetworkingConnectionState_Linger:
+			Assert( eOldState == k_ESteamNetworkingConnectionState_Connected );
+			m_eConnectionWireState = k_ESteamNetworkingConnectionState_Connected;
+			break;
+	}
+
+	// Certain connection options cannot be changed after a certain point
+	bool bLock = false;
+	if ( GetState() == k_ESteamNetworkingConnectionState_Connecting )
+	{
+		if ( m_bConnectionInitiatedRemotely )
 		{
-			// Are we still associated with our session?
-			if ( m_pMessagesSession )
-			{
-				// How did we get here?  We should be closed!
-				if ( m_pMessagesSession->m_pConnection != this )
-				{
-					AssertMsg2( false, "Connection/session linkage bookkeeping bug!  %s state %d", GetDescription(), (int)GetState() );
-				}
-				else
-				{
-					m_pMessagesSession->ConnectionStateChanged( eOldAPIState, eNewAPIState );
-				}
-			}
-			else
-			{
-				// We should only detach after being closed or destroyed.
-				AssertMsg2( GetState() == k_ESteamNetworkingConnectionState_FinWait || GetState() == k_ESteamNetworkingConnectionState_Dead || GetState() == k_ESteamNetworkingConnectionState_None,
-					"Connection %s has detatched from messages session, but is in state %d", GetDescription(), (int)GetState() );
-			}
+			// Remote host initiated the connection.  All options below can be tweaked
+			// until
 		}
 		else
 		{
+			// We initiated the connection.  All options listed below must be set at creation time
+			bLock = true;
+		}
+	}
+	else if ( BStateIsActive() )
+	{
+		bLock = true;
+	}
+	if ( bLock )
+	{
+		// Can't change certain options after this point
+		m_connectionConfig.m_IP_AllowWithoutAuth.Lock();
+		m_connectionConfig.m_Unencrypted.Lock();
+		m_connectionConfig.m_SymmetricConnect.Lock();
+		#ifdef STEAMNETWORKINGSOCKETS_ENABLE_SDR
+			m_connectionConfig.m_SDRClient_DebugTicketAddress.Lock();
+		#endif
+		#ifdef STEAMNETWORKINGSOCKETS_ENABLE_ICE
+			m_connectionConfig.m_P2P_Transport_ICE_Enable.Lock();
+		#endif
+	}
 
-			// Ordinary connection.  Check for posting callback, if connection state has changed from
-			// an API perspective
-			if ( eOldAPIState != eNewAPIState )
+	// Post a notification when certain state changes occur.  Note that
+	// "internal" state changes, where the connection is effectively closed
+	// from the application's perspective, are not relevant
+	const ESteamNetworkingConnectionState eOldAPIState = CollapseConnectionStateToAPIState( eOldState );
+	const ESteamNetworkingConnectionState eNewAPIState = CollapseConnectionStateToAPIState( GetState() );
+
+	// Internal connection used by the higher-level messages interface?
+	Assert( m_nSupressStateChangeCallbacks >= 0 );
+	if ( m_nSupressStateChangeCallbacks == 0 )
+	{
+		// Check for posting callback, if connection state has changed from an API perspective
+		if ( eOldAPIState != eNewAPIState )
+		{
+			if ( eOldState == k_ESteamNetworkingConnectionState_None && GetState() == k_ESteamNetworkingConnectionState_ProblemDetectedLocally )
+			{
+				// Do not post callbacks for internal failures during connection creation
+			}
+			else
 			{
 				PostConnectionStateChangedCallback( eOldAPIState, eNewAPIState );
 			}
@@ -2150,6 +2308,10 @@ void CSteamNetworkConnectionBase::SetState( ESteamNetworkingConnectionState eNew
 		case k_ESteamNetworkingConnectionState_FinWait:
 		case k_ESteamNetworkingConnectionState_ClosedByPeer:
 
+			// Check for leaving connected state
+			if ( m_statsEndToEnd.m_usecWhenStartedConnectedState != 0 && m_statsEndToEnd.m_usecWhenEndedConnectedState == 0 )
+				m_statsEndToEnd.m_usecWhenEndedConnectedState = usecNow;
+
 			// Let stats tracking system know that it shouldn't
 			// expect to be able to get stuff acked, etc
 			m_statsEndToEnd.SetPassive( true, m_usecWhenEnteredConnectionState );
@@ -2163,6 +2325,7 @@ void CSteamNetworkConnectionBase::SetState( ESteamNetworkingConnectionState eNew
 
 			// Key exchange should be complete
 			Assert( m_bCryptKeysValid );
+			Assert( m_statsEndToEnd.m_usecWhenStartedConnectedState != 0 );
 
 			// Link stats tracker should send and expect, acks, keepalives, etc
 			m_statsEndToEnd.SetPassive( false, m_usecWhenEnteredConnectionState );
@@ -2179,9 +2342,6 @@ void CSteamNetworkConnectionBase::SetState( ESteamNetworkingConnectionState eNew
 			break;
 
 		case k_ESteamNetworkingConnectionState_Connecting:
-
-			// If we've completed key exchange, then we should be connected
-			Assert( !m_bCryptKeysValid );
 
 			// And we shouldn't mark stats object as ready until we go connected
 			Assert( m_statsEndToEnd.IsPassive() );
@@ -2226,7 +2386,12 @@ bool CSteamNetworkConnectionBase::ReceivedMessage( const void *pData, int cbData
 	// Create a message
 	CSteamNetworkingMessage *pMsg = CSteamNetworkingMessage::New( this, cbData, nMsgNum, nFlags, usecNow );
 	if ( !pMsg )
+	{
+		// Hm.  this failure really is probably a sign that we are in a pretty bad state,
+		// and we are unlikely to recover.  Should we just abort the connection?
+		// Right now, we'll try to muddle on.
 		return false;
+	}
 
 	// Copy the data
 	memcpy( pMsg->m_pData, pData, cbData );
@@ -2240,33 +2405,10 @@ bool CSteamNetworkConnectionBase::ReceivedMessage( const void *pData, int cbData
 void CSteamNetworkConnectionBase::ReceivedMessage( CSteamNetworkingMessage *pMsg )
 {
 
-	SpewType( m_connectionConfig.m_LogLevel_Message.Get(), "[%s] RecvMessage MsgNum=%lld sz=%d\n",
+	SpewVerboseGroup( m_connectionConfig.m_LogLevel_Message.Get(), "[%s] RecvMessage MsgNum=%lld sz=%d\n",
 		GetDescription(),
 		(long long)pMsg->m_nMessageNumber,
 		pMsg->m_cbSize );
-
-	// Special case for internal connections used by Messages interface
-	if ( m_pMessagesInterface )
-	{
-		// Are we still associated with our session?
-		if ( !m_pMessagesSession )
-		{
-			// How did we get here?  We should be closed, and once closed,
-			// we should not receive any more messages
-			AssertMsg2( false, "Received message for connection %s associated with Messages interface, but no session.  Connection state is %d", GetDescription(), (int)GetState() );
-			pMsg->Release();
-		}
-		else if ( m_pMessagesSession->m_pConnection != this )
-		{
-			AssertMsg2( false, "Connection/session linkage bookkeeping bug!  %s state %d", GetDescription(), (int)GetState() );
-			pMsg->Release();
-		}
-		else
-		{
-			m_pMessagesSession->ReceivedMessage( pMsg );
-		}
-		return;
-	}
 
 	// Add to end of my queue.
 	pMsg->LinkToQueueTail( &CSteamNetworkingMessage::m_links, &m_queueRecvMessages );
@@ -2282,7 +2424,28 @@ void CSteamNetworkConnectionBase::PostConnectionStateChangedCallback( ESteamNetw
 	ConnectionPopulateInfo( c.m_info );
 	c.m_eOldState = eOldAPIState;
 	c.m_hConn = m_hConnectionSelf;
-	m_pSteamNetworkingSocketsInterface->QueueCallback( c );
+
+	// !KLUDGE! For ISteamnetworkingMessages connections, we want to process the callback immediately.
+	void *fnCallback = m_connectionConfig.m_Callback_ConnectionStatusChanged.Get();
+	if ( IsConnectionForMessagesSession() )
+	{
+		if ( fnCallback )
+		{
+			FnSteamNetConnectionStatusChanged fnConnectionStatusChanged = (FnSteamNetConnectionStatusChanged)( fnCallback );
+			(*fnConnectionStatusChanged)( &c );
+		}
+		else
+		{
+			// Currently there is no use case that does this.  It's probably a bug.
+			Assert( false );
+		}
+	}
+	else
+	{
+
+		// Typical codepath - post to a queue
+		m_pSteamNetworkingSocketsInterface->QueueCallback( c, fnCallback );
+	}
 }
 
 void CSteamNetworkConnectionBase::ConnectionState_ProblemDetectedLocally( ESteamNetConnectionEnd eReason, const char *pszFmt, ... )
@@ -2306,7 +2469,8 @@ void CSteamNetworkConnectionBase::ConnectionState_ProblemDetectedLocally( ESteam
 		case k_ESteamNetworkingConnectionState_Dead:
 		case k_ESteamNetworkingConnectionState_None:
 		default:
-			Assert( false );
+			AssertMsg( false, "[%s] problem (%d) %s, but connection already dead (%d %d %s)",
+				GetDescription(), (int)eReason, pszFmt, GetState(), (int)m_eEndReason, m_szEndDebug );
 			return;
 
 		case k_ESteamNetworkingConnectionState_ProblemDetectedLocally:
@@ -2415,6 +2579,42 @@ void CSteamNetworkConnectionBase::ConnectionState_ClosedByPeer( int nReason, con
 	}
 }
 
+bool CSteamNetworkConnectionBase::BConnectionState_Connecting( SteamNetworkingMicroseconds usecNow, SteamNetworkingErrMsg &errMsg )
+{
+	// Already failed (and they didn't handle it)?  We should only transition to this state from the initial state
+	if ( GetState() != k_ESteamNetworkingConnectionState_None )
+	{
+		V_sprintf_safe( errMsg, "Unexpected state %d", GetState() );
+		AssertMsg( false, "[%s] %s", GetDescription(), errMsg );
+		return false;
+	}
+
+	// Check if symmetric mode is being requested, but doesn't make sense
+	if ( BSymmetricMode() )
+	{
+		if ( !BSupportsSymmetricMode() )
+		{
+			V_strcpy_safe( errMsg, "SymmetricConnect not supported" );
+			return false;
+		}
+		if ( m_identityRemote.IsInvalid() )
+		{
+			V_strcpy_safe( errMsg, "Remote identity must be known to use symmetric mode" );
+			AssertMsg( false, errMsg );
+			return false;
+		}
+	}
+
+	// Set the state
+	SetState( k_ESteamNetworkingConnectionState_Connecting, usecNow );
+
+	// Schedule a wakeup call ASAP so we can start sending out packets immediately
+	SetNextThinkTimeASAP();
+
+	// OK
+	return true;
+}
+
 void CSteamNetworkConnectionBase::ConnectionState_Connected( SteamNetworkingMicroseconds usecNow )
 {
 	// Check our state
@@ -2435,6 +2635,10 @@ void CSteamNetworkConnectionBase::ConnectionState_Connected( SteamNetworkingMicr
 			{
 				// We must receive a packet in order to be connected!
 				Assert( m_statsEndToEnd.m_usecTimeLastRecv > 0 );
+
+				// Should only enter this state once
+				Assert( m_statsEndToEnd.m_usecWhenStartedConnectedState == 0 );
+				m_statsEndToEnd.m_usecWhenStartedConnectedState = usecNow;
 
 				// Spew, if this is newsworthy
 				if ( !m_bConnectionInitiatedRemotely || GetState() == k_ESteamNetworkingConnectionState_FindingRoute )
@@ -2497,6 +2701,11 @@ void CSteamNetworkConnectionBase::Think( SteamNetworkingMicroseconds usecNow )
 		delete this;
 		return;
 	}
+
+	// Safety check against leaving callbacks suppressed.  If this fires, there's a good chance
+	// we have already suppressed a callback that we should have posted, which is very bad
+	AssertMsg( m_nSupressStateChangeCallbacks == 0, "[%s] m_nSupressStateChangeCallbacks left on!", GetDescription() );
+	m_nSupressStateChangeCallbacks = 0;
 
 	// CheckConnectionStateAndSetNextThinkTime does all the work of examining the current state
 	// and deciding what to do.  But it should be safe to call at any time, whereas Think()
@@ -2561,7 +2770,7 @@ void CSteamNetworkConnectionBase::CheckConnectionStateAndSetNextThinkTime( Steam
 		{
 			// We don't send any data packets or keepalives in this state.
 			// We're just waiting for the client API to close us.  Let's check
-			// in once after a pretty lengthy delay, and assert if we're stil alive
+			// in once after a pretty lengthy delay, and assert if we're still alive
 			SteamNetworkingMicroseconds usecTimeout = m_usecWhenEnteredConnectionState + 20*k_nMillion;
 			if ( usecNow >= usecTimeout )
 			{
@@ -2587,7 +2796,9 @@ void CSteamNetworkConnectionBase::CheckConnectionStateAndSetNextThinkTime( Steam
 				// We should squawk about this and let them know.
 				if ( m_eConnectionState != k_ESteamNetworkingConnectionState_FindingRoute && m_bConnectionInitiatedRemotely )
 				{
-					if ( m_pMessagesSession )
+					// Discard this warning for messages sessions.  It's part of the messages API design
+					// that the app can ignore these connections if they do not want to accept them.
+					if ( IsConnectionForMessagesSession() )
 					{
 						ConnectionState_ProblemDetectedLocally( k_ESteamNetConnectionEnd_Misc_Timeout, "%s", "App did not respond to Messages session request in time, discarding." );
 					}
@@ -2672,7 +2883,7 @@ void CSteamNetworkConnectionBase::CheckConnectionStateAndSetNextThinkTime( Steam
 	UpdateMTUFromConfig();
 
 	// Check for sending keepalives or probing a connection that appears to be timing out
-	if ( m_eConnectionState != k_ESteamNetworkingConnectionState_Connecting && m_eConnectionState != k_ESteamNetworkingConnectionState_FindingRoute )
+	if ( BStateIsConnectedForWirePurposes() )
 	{
 		Assert( m_statsEndToEnd.m_usecTimeLastRecv > 0 ); // How did we get connected without receiving anything end-to-end?
 		AssertMsg2( !m_statsEndToEnd.IsPassive(), "[%s] stats passive, but in state %d?", GetDescription(), (int)GetState() );
@@ -2729,67 +2940,34 @@ void CSteamNetworkConnectionBase::CheckConnectionStateAndSetNextThinkTime( Steam
 			UpdateMinThinkTime( usecNow + 50*1000 );
 		}
 
-		// Check for keepalives of varying urgency.
-		// Ping aggressively because connection appears to be timing out?
-		if ( m_statsEndToEnd.m_nReplyTimeoutsSinceLastRecv > 0 || m_statsEndToEnd.m_usecWhenTimeoutStarted > 0 )
+		// Check for sending keepalives and stats
+		if ( bCanSendEndToEnd )
 		{
-			SteamNetworkingMicroseconds usecSendAggressivePing = Max( m_statsEndToEnd.m_usecTimeLastRecv, m_statsEndToEnd.m_usecLastSendPacketExpectingImmediateReply ) + k_usecAggressivePingInterval;
-			if ( usecNow >= usecSendAggressivePing )
-			{
-				if ( bCanSendEndToEnd )
-				{
-					if ( m_statsEndToEnd.m_nReplyTimeoutsSinceLastRecv == 1 )
-						SpewVerbose( "[%s] Reply timeout, last recv %.1fms ago.  Sending keepalive.\n", GetDescription(), ( usecNow - m_statsEndToEnd.m_usecTimeLastRecv ) * 1e-3 );
-					else
-						SpewMsg( "[%s] %d reply timeouts, last recv %.1fms ago.  Sending keepalive.\n", GetDescription(), m_statsEndToEnd.m_nReplyTimeoutsSinceLastRecv, ( usecNow - m_statsEndToEnd.m_usecTimeLastRecv ) * 1e-3 );
-					Assert( m_statsEndToEnd.BNeedToSendPingImmediate( usecNow ) ); // Make sure logic matches
-					m_pTransport->SendEndToEndStatsMsg( k_EStatsReplyRequest_Immediate, usecNow, "E2ETimingOutKeepalive" );
-					AssertMsg( !m_statsEndToEnd.BNeedToSendPingImmediate( usecNow ), "SendEndToEndStatsMsg didn't do its job!" );
-					Assert( m_statsEndToEnd.m_usecInFlightReplyTimeout > 0 );
-				}
-				else
-				{
-					// Nothing we can do right now.  Just check back in a little bit.
-					UpdateMinThinkTime( usecNow+20*1000 );
-				}
-			}
-			else
-			{
-				UpdateMinThinkTime( usecSendAggressivePing );
-			}
-		}
 
-		// Ordinary keepalive?
-		if ( m_statsEndToEnd.m_usecInFlightReplyTimeout == 0 )
-		{
-			// FIXME We really should be a lot better here with an adaptive keepalive time.  If they have been
-			// sending us a steady stream of packets, we could expect it to continue at a high rate, so that we
-			// can begin to detect a dropped connection much more quickly.  But if the connection is mostly idle, we want
-			// to make sure we use a relatively long keepalive.
-			SteamNetworkingMicroseconds usecSendKeepalive = m_statsEndToEnd.m_usecTimeLastRecv+k_usecKeepAliveInterval;
-			if ( usecNow >= usecSendKeepalive )
+			// Urgent keepalive because we are timing out?
+			SteamNetworkingMicroseconds usecStatsNextThinkTime = k_nThinkTime_Never;
+			EStatsReplyRequest eReplyRequested;
+			const char *pszStatsReason = m_statsEndToEnd.GetSendReasonOrUpdateNextThinkTime( usecNow, eReplyRequested, usecStatsNextThinkTime );
+			if ( pszStatsReason )
 			{
-				if ( bCanSendEndToEnd )
-				{
-					Assert( m_statsEndToEnd.BNeedToSendKeepalive( usecNow ) ); // Make sure logic matches
-					m_pTransport->SendEndToEndStatsMsg( k_EStatsReplyRequest_DelayedOK, usecNow, "E2EKeepalive" );
-					AssertMsg( !m_statsEndToEnd.BNeedToSendKeepalive( usecNow ), "SendEndToEndStatsMsg didn't do its job!" );
-				}
-				else
-				{
-					// Nothing we can do right now.  Just check back in a little bit.
-					UpdateMinThinkTime( usecNow+20*1000 );
-				}
+
+				// Spew if we're dropping replies
+				if ( m_statsEndToEnd.m_nReplyTimeoutsSinceLastRecv == 1 )
+					SpewVerbose( "[%s] Reply timeout, last recv %.1fms ago.  Sending keepalive.\n", GetDescription(), ( usecNow - m_statsEndToEnd.m_usecTimeLastRecv ) * 1e-3 );
+				else if ( m_statsEndToEnd.m_nReplyTimeoutsSinceLastRecv > 0 )
+					SpewMsg( "[%s] %d reply timeouts, last recv %.1fms ago.  Sending keepalive.\n", GetDescription(), m_statsEndToEnd.m_nReplyTimeoutsSinceLastRecv, ( usecNow - m_statsEndToEnd.m_usecTimeLastRecv ) * 1e-3 );
+
+				// Send it
+				m_pTransport->SendEndToEndStatsMsg( eReplyRequested, usecNow, pszStatsReason );
+
+				// Re-calculate next think time
+				usecStatsNextThinkTime = k_nThinkTime_Never;
+				const char *pszStatsReason2 = m_statsEndToEnd.GetSendReasonOrUpdateNextThinkTime( usecNow, eReplyRequested, usecStatsNextThinkTime );
+				AssertMsg1( pszStatsReason2 == nullptr && usecStatsNextThinkTime > usecNow, "Stats sending didn't clear stats need to send reason %s!", pszStatsReason2 ? pszStatsReason2 : "??" );
 			}
-			else
-			{
-				// Not right now, but schedule a wakeup call to do it
-				UpdateMinThinkTime( usecSendKeepalive );
-			}
-		}
-		else
-		{
-			UpdateMinThinkTime( m_statsEndToEnd.m_usecInFlightReplyTimeout );
+
+			// Make sure we are scheduled to wake up the next time we need to take action
+			UpdateMinThinkTime( usecStatsNextThinkTime );
 		}
 	}
 
@@ -2805,6 +2983,11 @@ void CSteamNetworkConnectionBase::CheckConnectionStateAndSetNextThinkTime( Steam
 
 void CSteamNetworkConnectionBase::ThinkConnection( SteamNetworkingMicroseconds usecNow )
 {
+}
+
+void CSteamNetworkConnectionBase::ProcessSNPPing( int msPing, RecvPacketContext_t &ctx )
+{
+	m_statsEndToEnd.m_ping.ReceivedPing( msPing, ctx.m_usecNow );
 }
 
 SteamNetworkingMicroseconds CSteamNetworkConnectionBase::ThinkConnection_FindingRoute( SteamNetworkingMicroseconds usecNow )
@@ -2840,30 +3023,25 @@ void CSteamNetworkConnectionBase::ConnectionTimedOut( SteamNetworkingMicrosecond
 	ESteamNetConnectionEnd nReasonCode;
 	ConnectionEndDebugMsg msg;
 
-	// Set some generic defaults using our base class version, so
-	// this function will work even if the derived class forgets to
-	// call the base class.
-	CSteamNetworkConnectionBase::GuessTimeoutReason( nReasonCode, msg, usecNow );
-
-	// Check if connection has a more enlightened understanding of what's wrong
-	GuessTimeoutReason( nReasonCode, msg, usecNow );
-
-	// Switch connection state
-	ConnectionState_ProblemDetectedLocally( nReasonCode, "%s", msg );
-}
-
-void CSteamNetworkConnectionBase::GuessTimeoutReason( ESteamNetConnectionEnd &nReasonCode, ConnectionEndDebugMsg &msg, SteamNetworkingMicroseconds usecNow )
-{
-	NOTE_UNUSED( usecNow );
-
+	// Set some generic defaults.
 	nReasonCode = k_ESteamNetConnectionEnd_Misc_Timeout;
 	switch ( GetState() )
 	{
 		case k_ESteamNetworkingConnectionState_Connecting:
-			V_strcpy_safe( msg, "Timed out attempting to connect" );
+			// Should use this more specific reason code at somepoint, when I add an API to get localized error messages
+			//if ( !m_bConnectionInitiatedRemotely && m_statsEndToEnd.m_usecTimeLastRecv == 0 )
+			//{
+			//	nReasonCode = k_ESteamNetConnectionEnd_Misc_ServerNeverReplied;
+			//	V_strcpy_safe( msg, "" );
+			//}
+			//else
+			//{
+				V_strcpy_safe( msg, "Timed out attempting to connect" );
+			//}
 			break;
 
 		case k_ESteamNetworkingConnectionState_FindingRoute:
+			nReasonCode = k_ESteamNetConnectionEnd_Misc_P2P_Rendezvous;
 			V_strcpy_safe( msg, "Timed out attempting to negotiate rendezvous" );
 			break;
 
@@ -2871,6 +3049,24 @@ void CSteamNetworkConnectionBase::GuessTimeoutReason( ESteamNetConnectionEnd &nR
 			V_strcpy_safe( msg, "Connection dropped" );
 			break;
 	}
+
+	// Check if connection has a more enlightened understanding of what's wrong
+	ConnectionGuessTimeoutReason( nReasonCode, msg, usecNow );
+
+	// Switch connection state
+	ConnectionState_ProblemDetectedLocally( nReasonCode, "%s", msg );
+}
+
+void CSteamNetworkConnectionBase::ConnectionGuessTimeoutReason( ESteamNetConnectionEnd &nReasonCode, ConnectionEndDebugMsg &msg, SteamNetworkingMicroseconds usecNow )
+{
+	// Base class, just delegate to active transport
+	if ( m_pTransport )
+		m_pTransport->TransportGuessTimeoutReason( nReasonCode, msg, usecNow );
+}
+
+void CConnectionTransport::TransportGuessTimeoutReason( ESteamNetConnectionEnd &nReasonCode, ConnectionEndDebugMsg &msg, SteamNetworkingMicroseconds usecNow )
+{
+	// No enlightenments at base class
 }
 
 void CSteamNetworkConnectionBase::UpdateSpeeds( int nTXSpeed, int nRXSpeed )
@@ -2943,8 +3139,8 @@ failed:
 
 	// Don't post any state changes for these transitions.  We just want to immediately start in the
 	// connected state
-	pConn[0]->m_bSupressStateChangeCallbacks = true;
-	pConn[1]->m_bSupressStateChangeCallbacks = true;
+	++pConn[0]->m_nSupressStateChangeCallbacks;
+	++pConn[1]->m_nSupressStateChangeCallbacks;
 
 	// Do generic base class initialization
 	for ( int i = 0 ; i < 2 ; ++i )
@@ -2977,12 +3173,17 @@ failed:
 			AssertMsg( false, "BRecvCryptoHandshake failed creating loopback pipe socket pair" );
 			goto failed;
 		}
+		if ( !p->BConnectionState_Connecting( usecNow, errMsg ) )
+		{
+			AssertMsg( false, "BConnectionState_Connecting failed creating loopback pipe socket pair.  %s", errMsg );
+			goto failed;
+		}
 		p->ConnectionState_Connected( usecNow );
 	}
 
 	// Any further state changes are legit
-	pConn[0]->m_bSupressStateChangeCallbacks = false;
-	pConn[1]->m_bSupressStateChangeCallbacks = false;
+	pConn[0]->m_nSupressStateChangeCallbacks = 0;
+	pConn[1]->m_nSupressStateChangeCallbacks = 0;
 	return true;
 }
 
@@ -3001,8 +3202,10 @@ CSteamNetworkConnectionPipe *CSteamNetworkConnectionPipe::CreateLoopbackConnecti
 	{
 		V_strcpy_safe( errMsg, "new CSteamNetworkConnectionPipe failed" );
 failed:
-		pClient->ConnectionDestroySelfNow();
-		pServer->ConnectionDestroySelfNow();
+		if ( pClient )
+			pClient->ConnectionDestroySelfNow();
+		if ( pServer )
+			pServer->ConnectionDestroySelfNow();
 		return nullptr;
 	}
 
@@ -3015,12 +3218,16 @@ failed:
 	if ( !pClient->BInitConnection( usecNow, nOptions, pOptions, errMsg ) )
 		goto failed;
 
-	// Client sends a "connect" packet
-	pClient->FakeSendStats( usecNow, 0 );
-
 	// Server receives the connection and starts "accepting" it
 	if ( !pServer->BBeginAccept( pListenSocket, usecNow, errMsg ) )
 		goto failed;
+
+	// Client sends a "connect" packet
+	if ( !pClient->BConnectionState_Connecting( usecNow, errMsg ) )
+		goto failed;
+	Assert( pServer->m_statsEndToEnd.m_nMaxRecvPktNum == 1 );
+	pClient->m_statsEndToEnd.m_nNextSendSequenceNumber = pServer->m_statsEndToEnd.m_nMaxRecvPktNum+1;
+	pClient->FakeSendStats( usecNow, 0 );
 
 	// Now we wait for the app to accept the connection
 	return pClient;
@@ -3128,7 +3335,8 @@ bool CSteamNetworkConnectionPipe::BBeginAccept( CSteamNetworkListenSocketBase *p
 		return false;
 	}
 
-	return true;
+	// Transition to connecting state
+	return BConnectionState_Connecting( usecNow, errMsg );
 }
 
 EResult CSteamNetworkConnectionPipe::AcceptConnection( SteamNetworkingMicroseconds usecNow )

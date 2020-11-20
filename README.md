@@ -20,14 +20,61 @@ GameNetworkingSockets is a basic transport layer for games.  The features are:
   key exchange and cert signatures. The details for shared key derivation and
   per-packet IV are based on the [design](https://docs.google.com/document/d/1g5nIXAIkN_Y-7XJW5K45IblHd_L2f5LTaDUDwvZ5L6g/edit?usp=sharing)
   used by Google's QUIC protocol.
-* Tools for simulating loss and detailed stats measurement
-* IPv6
+* Tools for simulating packet latency/loss, and detailed stats measurement
+* IPv6 support
+* Peer-to-peer networking:
+  * NAT traversal through google WebRTC's ICE implementation.
+  * Plug in your own signaling service.
+  * Unique "symmetric connect" mode.
+  * [``ISteamNetworkingMessages``](include/steam/isteamnetworkingmessages.h) is an
+    interface designed to make it easy to port UDP-based code to P2P use cases.  (By
+    UDP-based, we mean non-connection-oriented code, where each time you send a
+    packet, you specify the recipient's address.)
+  * See [README_P2P.md](README_P2P.md) for more info
 
 What it does *not* do:
 
 * Higher level serialization of entities, delta encoding of changed state
   variables, etc
 * Compression
+
+## Quick API overview
+
+To get an idea of what the API is like, here are a few things to check out:
+
+* The [include/steam](include/steam) folder has the public API headers.
+  * [``ISteamNetworkingSockets``](include/steam/isteamnetworkingsockets.h) is the
+    most important interface.
+  * [``steamnetworkingtypes.h``](include/steam/steamnetworkingtypes.h) has misc
+    types and declarations.
+* The
+  [Steamworks SDK documentation](https://partner.steamgames.com/doc/api/ISteamNetworkingSockets)
+  offers web-based documentation for these APIs.  Note that some features
+  are only available on Steam, such as Steam's authentication service,
+  signaling service, and the SDR relay service.
+* Look at these examples:
+  * [example_chat.cpp](examples/example_chat.cpp).  Very simple client/server
+    program using all reliable messages over ordinary IPv4.
+  * [test_p2p.cpp](tests/test_p2p.cpp).  Shows how to get two hosts to connect
+    to each other using P2P connectivity.  Also an example of how to write a
+    signaling service plugin.
+
+## Building
+
+See [BUILDING](BUILDING.md) for more information.
+
+## Language bindings
+
+The library was written in C++, but there is also a plain C interface
+to facilitate binding to other languages.
+
+Third party language bindings:
+
+* C#:
+  * <https://github.com/nxrighthere/ValveSockets-CSharp>
+  * <https://github.com/Facepunch/Facepunch.Steamworks>
+* Go:
+  * <https://github.com/nielsAD/gns/>
 
 ## Why do I see "Steam" everywhere?
 
@@ -56,52 +103,3 @@ trauma.  Also if you see code that appears to have unnecessary layers of
 abstraction, it's probably because those layers are needed to support relayed
 connection types or some part of the Steamworks SDK.
 
-## Building
-
-See [BUILDING](BUILDING.md) for more information.
-
-## Language bindings
-
-The library was written in C++, but there is also a plain C interface
-to facilitate binding to other languages.
-
-Third party language bindings:
-
-* C#: <https://github.com/nxrighthere/ValveSockets-CSharp>
-* Go: <https://github.com/nielsAD/gns/>
-
-## Roadmap
-
-Here are some large features that we expect to add to a future release:
-
-### Bandwidth estimation
-
-An earlier version of this code implemented TCP-friendly rate control (RFC
-5348).  But as part of the reliability layer rewrite, bandwidth estimation has
-been temporarily broken, and a fixed (configurable) rate is used.  It's not
-clear if it's worth the complexity of implementation and testing to get
-sender-calculated TCP-friendly rate control implemented, or a simpler method
-would do just as good.  Whatever method we use, needs to work even if the app
-code inspects the state and decides not to send a message.  In this case, the
-bandwidth estimation logic might perceive that the channel is not
-"data-limited", when it essentially is.  We could add an entry point to allow
-the application to express this, but this is getting complicated, making it more
-difficult for app code to do the right thing.  It'd be better if it mostly
-"just worked" when app code does the simple thing.
-
-### NAT piercing (ICE/STUN/TURN)
-
-The Steamworks code supports a custom protocol for relaying packets through our
-network of relays and on our backbone.  At this time the open-source code does
-not have any support for piercing NAT or relaying packets.  But since the
-Steamworks code already has those concepts, it should be pretty easy to add
-support for this.  You'd still be responsible for running the STUN/TURN servers
-and doing the rendezvous/signalling, but the code could use them.
-
-### Non-connection-oriented interface
-
-The Steam version has ISteamMessages, which is a UDP-like interface.  Messages
-are addressed by peer identity, not connection handle.  (Both reliable and
-unreliable messages are still supported.)  We should open-source this API,
-too.  Previously it was only for P2P, but we've found that it's useful for
-porting UDP-based code.

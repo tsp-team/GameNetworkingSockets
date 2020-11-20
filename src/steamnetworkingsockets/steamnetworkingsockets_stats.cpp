@@ -4,6 +4,13 @@
 #include <tier1/utlbuffer.h>
 #include "steamnetworking_statsutils.h"
 
+// !KLUDGE! For SteamNetworkingSockets_GetLocalTimestamp
+#ifdef IS_STEAMDATAGRAMROUTER
+	#include "router/sdr.h"
+#else
+	#include "clientlib/steamnetworkingsockets_lowlevel.h"
+#endif
+
 // Must be the last include
 #include <tier0/memdbgon.h>
 
@@ -30,6 +37,7 @@ void SteamDatagramLinkInstantaneousStats::Clear()
 void SteamDatagramLinkLifetimeStats::Clear()
 {
 	memset( this, 0, sizeof(*this) );
+	m_nConnectedSeconds = -1;
 	m_nPingNtile5th = -1;
 	m_nPingNtile50th = -1;
 	m_nPingNtile75th = -1;
@@ -141,14 +149,16 @@ void LinkStatsTrackerBase::InitInternal( SteamNetworkingMicroseconds usecNow )
 	m_nNextSendSequenceNumber = 1;
 	m_usecTimeLastSentSeq = 0;
 	InitMaxRecvPktNum( 0 );
+	m_seqPktCounters.Reset();
 	m_flInPacketsDroppedPct = -1.0f;
-	m_usecMaxJitterPreviousInterval = -1;
 	m_flInPacketsWeirdSequencePct = -1.0f;
+	m_usecMaxJitterPreviousInterval = -1;
 	m_nPktsRecvSequenced = 0;
-	m_nPktsRecvDropped = 0;
-	m_nPktsRecvOutOfOrder = 0;
-	m_nPktsRecvDuplicate = 0;
-	m_nPktsRecvSequenceNumberLurch = 0;
+	m_nDebugPktsRecvInOrder = 0;
+	m_nPktsRecvDroppedAccumulator = 0;
+	m_nPktsRecvOutOfOrderAccumulator = 0;
+	m_nPktsRecvDuplicateAccumulator = 0;
+	m_nPktsRecvLurchAccumulator = 0;
 	m_usecTimeLastRecv = 0;
 	m_usecTimeLastRecvSeq = 0;
 	memset( &m_latestRemote, 0, sizeof(m_latestRemote) );
@@ -186,10 +196,11 @@ void LinkStatsTrackerBase::SetPassiveInternal( bool bFlag, SteamNetworkingMicros
 
 void LinkStatsTrackerBase::StartNextInterval( SteamNetworkingMicroseconds usecNow )
 {
-	m_nPktsRecvSequencedCurrentInterval = 0;
-	m_nPktsRecvDroppedCurrentInterval = 0;
-	m_nPktsRecvWeirdSequenceCurrentInterval = 0;
-	m_usecMaxJitterCurrentInterval = -1;
+	m_nPktsRecvDroppedAccumulator += m_seqPktCounters.m_nDropped;
+	m_nPktsRecvOutOfOrderAccumulator += m_seqPktCounters.m_nOutOfOrder;
+	m_nPktsRecvDuplicateAccumulator += m_seqPktCounters.m_nDuplicate;
+	m_nPktsRecvLurchAccumulator += m_seqPktCounters.m_nLurch;
+	m_seqPktCounters.Reset();
 	m_usecIntervalStart = usecNow;
 }
 
@@ -202,9 +213,10 @@ void LinkStatsTrackerBase::UpdateInterval( SteamNetworkingMicroseconds usecNow )
 	COMPILE_TIME_ASSERT( k_usecSteamDatagramLinkStatsDefaultInterval >= 5*k_nMillion );
 	if ( flElapsed > 4.5f )
 	{
-		if ( m_nPktsRecvSequencedCurrentInterval > 5 )
+		if ( m_seqPktCounters.m_nRecv > 5 )
 		{
-			int nBad = m_nPktsRecvDroppedCurrentInterval + m_nPktsRecvWeirdSequenceCurrentInterval;
+			int nWeird = m_seqPktCounters.Weird();
+			int nBad = m_seqPktCounters.m_nDropped + nWeird;
 			if ( nBad == 0 )
 			{
 				// Perfect connection.  This will hopefully be relatively common
@@ -215,8 +227,8 @@ void LinkStatsTrackerBase::UpdateInterval( SteamNetworkingMicroseconds usecNow )
 			{
 
 				// Less than perfect.  Compute quality metric.
-				int nTotalSent = m_nPktsRecvSequencedCurrentInterval + m_nPktsRecvDroppedCurrentInterval;
-				int nRecvGood = m_nPktsRecvSequencedCurrentInterval - m_nPktsRecvWeirdSequenceCurrentInterval;
+				int nTotalSent = m_seqPktCounters.m_nRecv + m_seqPktCounters.m_nDropped;
+				int nRecvGood = m_seqPktCounters.m_nRecv - nWeird;
 				int nQuality = nRecvGood * 100 / nTotalSent;
 
 				// Cap at 99, since 100 is reserved to mean "perfect",
@@ -266,9 +278,9 @@ void LinkStatsTrackerBase::UpdateInterval( SteamNetworkingMicroseconds usecNow )
 	m_recv.UpdateInterval( flElapsed );
 	m_recvExceedRateLimit.UpdateInterval( flElapsed );
 
-	// Calculate rate of packet flow imperfections
-	Assert( m_nPktsRecvWeirdSequenceCurrentInterval <= m_nPktsRecvSequencedCurrentInterval );
-	if ( m_nPktsRecvSequencedCurrentInterval <= 0 )
+	int nWeirdSequenceCurrentInterval = m_seqPktCounters.Weird();
+	Assert( nWeirdSequenceCurrentInterval <= m_seqPktCounters.m_nRecv );
+	if ( m_seqPktCounters.m_nRecv <= 0 )
 	{
 		// No sequenced packets received during interval, so no data available
 		m_flInPacketsDroppedPct = -1.0f;
@@ -276,13 +288,13 @@ void LinkStatsTrackerBase::UpdateInterval( SteamNetworkingMicroseconds usecNow )
 	}
 	else
 	{
-		float flToPct = 1.0f / float( m_nPktsRecvSequencedCurrentInterval + m_nPktsRecvDroppedCurrentInterval );
-		m_flInPacketsDroppedPct = m_nPktsRecvDroppedCurrentInterval * flToPct;
-		m_flInPacketsWeirdSequencePct = m_nPktsRecvWeirdSequenceCurrentInterval * flToPct;
+		float flToPct = 1.0f / float( m_seqPktCounters.m_nRecv + m_seqPktCounters.m_nDropped );
+		m_flInPacketsDroppedPct = m_seqPktCounters.m_nDropped * flToPct;
+		m_flInPacketsWeirdSequencePct = nWeirdSequenceCurrentInterval * flToPct;
 	}
 
 	// Peak jitter value
-	m_usecMaxJitterPreviousInterval = m_usecMaxJitterCurrentInterval;
+	m_usecMaxJitterPreviousInterval = m_seqPktCounters.m_usecMaxJitter;
 
 	// Reset for next time
 	StartNextInterval( usecNow );
@@ -301,159 +313,84 @@ void LinkStatsTrackerBase::InitMaxRecvPktNum( int64 nPktNum )
 		m_recvPktNumberMask[1] = ~(uint64)0;
 	else
 		m_recvPktNumberMask[1] = ( (uint64)1 << nBitsToSet ) - 1;
+
+	m_nDebugLastInitMaxRecvPktNum = nPktNum;
 }
 
-bool LinkStatsTrackerBase::BCheckPacketNumberOldOrDuplicate( int64 nPktNum )
+std::string LinkStatsTrackerBase::RecvPktNumStateDebugString() const
 {
-	// We've received a packet with a sequence number.
-	// Update stats
-	++m_nPktsRecvSequencedCurrentInterval;
-	++m_nPktsRecvSequenced;
-
-	// Packet number is increasing?
-	// (Maybe by a lot -- we don't handle that here.)
-	if ( likely( nPktNum > m_nMaxRecvPktNum ) )
-		return true;
-
-	// Which block of 64-bit packets is it in?
-	int64 B = m_nMaxRecvPktNum & ~int64{63};
-	int64 idxRecvBitmask = ( ( nPktNum - B ) >> 6 ) + 1;
-	Assert( idxRecvBitmask < 2 );
-	if ( idxRecvBitmask < 0 )
-	{
-		// Too old (at least 64 packets old, maybe up to 128).
-		// Track stats, both lifetime and current interval
-		++m_nPktsRecvSequenceNumberLurch; // Should we track this under a different stat?
-		++m_nPktsRecvWeirdSequenceCurrentInterval;
-		return false;
-	}
-	uint64 bit = uint64{1} << ( nPktNum & 63 );
-	if ( m_recvPktNumberMask[ idxRecvBitmask ] & bit )
-	{
-		// Duplicate
-		// Track stats, both lifetime and current interval
-		++m_nPktsRecvDuplicate;
-		++m_nPktsRecvWeirdSequenceCurrentInterval;
-		return false;
-	}
-
-	// We have an out of order packet.  We'll update that
-	// stat in TrackProcessSequencedPacket
-	Assert( nPktNum > 0 && nPktNum < m_nMaxRecvPktNum );
-	return true;
+	char buf[256];
+	V_sprintf_safe( buf,
+		"maxrecv=%lld, init=%lld, inorder=%lld, mask=%llx,%llx",
+		(long long)m_nMaxRecvPktNum, (long long)m_nDebugLastInitMaxRecvPktNum, (long long)m_nDebugPktsRecvInOrder,
+		(unsigned long long)m_recvPktNumberMask[0], (unsigned long long)m_recvPktNumberMask[1] );
+	return std::string(buf);
 }
 
-void LinkStatsTrackerBase::TrackProcessSequencedPacket( int64 nPktNum, SteamNetworkingMicroseconds usecNow, int usecSenderTimeSincePrev )
+std::string LinkStatsTrackerBase::HistoryRecvSeqNumDebugString( int nMaxPkts ) const
 {
-	Assert( nPktNum > 0 );
+	constexpr int N = V_ARRAYSIZE( m_arDebugHistoryRecvSeqNum );
+	COMPILE_TIME_ASSERT( ( N & (N-1) ) == 0 );
+	nMaxPkts = std::min( nMaxPkts, N );
 
-	// Update bitfield of received packets
-	int64 B = m_nMaxRecvPktNum & ~int64{63};
-	int64 idxRecvBitmask = ( ( nPktNum - B ) >> 6 ) + 1;
-	Assert( idxRecvBitmask >= 0 ); // We should have discarded very old packets already
-	if ( idxRecvBitmask >= 2 ) // Most common case is 0 or 1
+	std::string result;
+	int64 idx = m_nPktsRecvSequenced;
+	while ( --nMaxPkts >= 0 && --idx >= 0 )
 	{
-		if ( idxRecvBitmask == 2 )
-		{
-			// Crossed to the next 64-packet block.  Shift bitmasks forward by one.
-			m_recvPktNumberMask[0] = m_recvPktNumberMask[1];
-		}
-		else
-		{
-			// Large packet number jump, we skipped a whole block
-			m_recvPktNumberMask[0] = 0;
-		}
-		m_recvPktNumberMask[1] = 0;
-		idxRecvBitmask = 1;
+		char buf[32];
+		V_sprintf_safe( buf, "%s%lld", result.empty() ? "" : ",", (long long)m_arDebugHistoryRecvSeqNum[ idx & (N-1) ] );
+		result.append( buf );
 	}
-	uint64 bit = uint64{1} << ( nPktNum & 63 );
-	Assert( !( m_recvPktNumberMask[ idxRecvBitmask ] & bit ) ); // Should not have already been marked!  We should have already discarded duplicates
-	m_recvPktNumberMask[ idxRecvBitmask ] |= bit;
 
-	// Check for dropped packet.  Since we hope that by far the most common
-	// case will be packets delivered in order, we optimize this logic
-	// for that case.
-	int64 nGap = nPktNum - m_nMaxRecvPktNum;
-	if ( likely( nGap == 1 ) )
+	return result;
+}
+
+void LinkStatsTrackerBase::InternalProcessSequencedPacket_OutOfOrder( int64 nPktNum )
+{
+
+	// We should have previously counted this packet as dropped.
+	if ( PktsRecvDropped() == 0 )
 	{
-
-		// We've received two packets, in order.  Did the sender supply the time between packets on his side?
-		if ( usecSenderTimeSincePrev > 0 )
+		// This is weird.
+		// !TEST! Only assert if we can provide more detailed info to debug.
+		// Also note that on the relay, old peers are using a single sequence
+		// number stream, shred across multiple sessions, and we are not
+		// tracking this properly, because we don't know which session we
+		// marked the "drop" in.
+		if ( m_nPktsRecvSequenced < 256 && m_nPeerProtocolVersion >= 9 )
 		{
-			int usecJitter = ( usecNow - m_usecTimeLastRecvSeq ) - usecSenderTimeSincePrev;
-			usecJitter = abs( usecJitter );
-			if ( usecJitter < k_usecTimeSinceLastPacketMaxReasonable )
-			{
-
-				// Update max jitter for current interval
-				m_usecMaxJitterCurrentInterval = Max( m_usecMaxJitterCurrentInterval, usecJitter );
-				m_jitterHistogram.AddSample( usecJitter );
-			}
-			else
-			{
-				// Something is really, really off.  Discard measurement
-			}
-		}
-
-	}
-	else if ( unlikely( nGap <= 0 ) )
-	{
-		// Packet number moving backward
-		// We should have already rejected duplicates
-		Assert( nGap != 0 );
-
-		// Packet number moving in reverse.
-		// It should be a *small* negative step, e.g. packets delivered out of order.
-		// If the packet is really old, we should have already discarded it earlier.
-		Assert( nGap >= -8 * (int64)sizeof(m_recvPktNumberMask) );
-		++m_nPktsRecvOutOfOrder;
-		++m_nPktsRecvWeirdSequenceCurrentInterval;
-
-		// We previously counted this packet as dropped.  Undo that, it wasn't dropped.
-		if ( m_nPktsRecvDropped > 0 )
-		{
-			--m_nPktsRecvDropped;
-		}
-		else
-		{
-			// This is weird.
-			AssertMsg8( false,
-				"No dropped packets, pkt num %lld -> %lld, dup bit not set?  recvseq=%lld, lurch=%lld, ooo=%lld, mask=[0x%llx, 0x%llx].  (%s)",
-				(long long)m_nMaxRecvPktNum, (long long)nPktNum,
-				(long long)m_nPktsRecvSequenced, (long long)m_nPktsRecvSequenceNumberLurch,
-				(long long)m_nPktsRecvOutOfOrder,
-				(unsigned long long)m_recvPktNumberMask[0], (unsigned long long)m_recvPktNumberMask[1],
+			AssertMsg( false,
+				"No dropped packets, pkt num %lld, dup bit not set?  recvseq=%lld inorder=%lld, dup=%lld, lurch=%lld, ooo=%lld, %s.  (%s)",
+				(long long)nPktNum, (long long)m_nPktsRecvSequenced,
+				(long long)m_nDebugPktsRecvInOrder, (long long)PktsRecvDuplicate(),
+				(long long)PktsRecvLurch(), (long long)PktsRecvOutOfOrder(),
+				RecvPktNumStateDebugString().c_str(),
 				Describe().c_str()
 			);
+	#ifdef IS_STEAMDATAGRAMROUTER
+			int64 idx = m_nPktsRecvSequenced-1;
+			while ( idx >= 0 )
+			{
+				CUtlBuffer buf( 0, 1024, CUtlBuffer::TEXT_BUFFER );
+				switch ( idx )
+				{
+				default: buf.Printf( "%7lld", (long long)m_arDebugHistoryRecvSeqNum[ idx-- & 255 ] ); 
+				case  6: buf.Printf( "%7lld", (long long)m_arDebugHistoryRecvSeqNum[ idx-- & 255 ] ); 
+				case  5: buf.Printf( "%7lld", (long long)m_arDebugHistoryRecvSeqNum[ idx-- & 255 ] ); 
+				case  4: buf.Printf( "%7lld", (long long)m_arDebugHistoryRecvSeqNum[ idx-- & 255 ] ); 
+				case  3: buf.Printf( "%7lld", (long long)m_arDebugHistoryRecvSeqNum[ idx-- & 255 ] ); 
+				case  2: buf.Printf( "%7lld", (long long)m_arDebugHistoryRecvSeqNum[ idx-- & 255 ] ); 
+				case  1: buf.Printf( "%7lld", (long long)m_arDebugHistoryRecvSeqNum[ idx-- & 255 ] ); 
+				case  0: buf.Printf( "%7lld", (long long)m_arDebugHistoryRecvSeqNum[ idx-- & 255 ] );
+				}
+				buf.PutChar( '\n' );
+				g_pLogger->Write( buf.Base(), buf.TellPut() );
+			}
+	#endif
 		}
-		if ( m_nPktsRecvDroppedCurrentInterval > 0 ) // Might have marked it in the previous interval.  Our stats will be slightly off in this case.  Not worth it to try to get this exactly right.
-			--m_nPktsRecvDroppedCurrentInterval;
-		return;
-	}
-	else 
-	{
-		// Packet number moving forward, i.e. a dropped packet
-		// Large gap?
-		if ( unlikely( nGap >= 100 ) )
-		{
-			// Very weird.
-			++m_nPktsRecvSequenceNumberLurch;
-			++m_nPktsRecvWeirdSequenceCurrentInterval;
-
-			// Reset the sequence number for packets going forward.
-			InitMaxRecvPktNum( nPktNum );
-			return;
-		}
-
-		// Probably the most common case (after a perfect packet stream), we just dropped a packet or two
-		int nDropped = nGap-1;
-		m_nPktsRecvDropped += nDropped;
-		m_nPktsRecvDroppedCurrentInterval += nDropped;
 	}
 
-	// Save highest known sequence number for next time.
-	m_nMaxRecvPktNum = nPktNum;
-	m_usecTimeLastRecvSeq = usecNow;
+	m_seqPktCounters.OnOutOfOrder();
 }
 
 bool LinkStatsTrackerBase::BCheckHaveDataToSendInstantaneous( SteamNetworkingMicroseconds usecNow )
@@ -467,7 +404,7 @@ bool LinkStatsTrackerBase::BCheckHaveDataToSendInstantaneous( SteamNetworkingMic
 
 	// Calculate threshold based on how much time has elapsed and a very low packet rate
 	int64 usecElapsed = usecNow - m_usecPeerAckedInstaneous;
-	Assert( usecElapsed >= k_usecLinkStatsInstantaneousReportMinInterval ); // don't call this unless you know it's been long enough!
+	Assert( usecElapsed >= k_usecLinkStatsInstantaneousReportInterval ); // don't call this unless you know it's been long enough!
 	int nThreshold = usecElapsed / k_usecActiveConnectionSendInterval;
 
 	// Has there been any traffic worth reporting on in this interval?
@@ -500,75 +437,85 @@ bool LinkStatsTrackerBase::BCheckHaveDataToSendLifetime( SteamNetworkingMicrosec
 	return false;
 }
 
-bool LinkStatsTrackerBase::BNeedToSendStats( SteamNetworkingMicroseconds usecNow )
+int LinkStatsTrackerBase::GetStatsSendNeed( SteamNetworkingMicroseconds usecNow )
 {
-	// Message already in flight?
-	if ( m_pktNumInFlight != 0 || m_bPassive )
-		return false;
-	bool bNeedToSendInstantaneous = ( m_usecPeerAckedInstaneous + k_usecLinkStatsInstantaneousReportMaxInterval < usecNow ) && BCheckHaveDataToSendInstantaneous( usecNow );
-	bool bNeedToSendLifetime = ( m_usecPeerAckedLifetime + k_usecLinkStatsLifetimeReportMaxInterval < usecNow ) && BCheckHaveDataToSendLifetime( usecNow );
-	return bNeedToSendInstantaneous || bNeedToSendLifetime;
-}
+	int nResult = 0;
 
-const char *LinkStatsTrackerBase::NeedToSendStats( SteamNetworkingMicroseconds usecNow, const char *const arpszReasonStrings[4] )
-{
 	// Message already in flight?
-	if ( m_pktNumInFlight != 0 || m_bPassive )
-		return nullptr;
-	int n = 0;
-	if ( m_usecPeerAckedInstaneous + k_usecLinkStatsInstantaneousReportMaxInterval < usecNow && BCheckHaveDataToSendInstantaneous( usecNow ) )
-		n |= 1;
-	if ( m_usecPeerAckedLifetime + k_usecLinkStatsLifetimeReportMaxInterval < usecNow && BCheckHaveDataToSendLifetime( usecNow ) )
-		n |= 2;
-	return arpszReasonStrings[n];
-}
-
-SteamNetworkingMicroseconds LinkStatsTrackerBase::GetNextThinkTimeInternal( SteamNetworkingMicroseconds usecNow ) const
-{
-	SteamNetworkingMicroseconds usecResult = INT64_MAX;
-	if ( !m_bPassive )
+	if ( m_pktNumInFlight == 0 && !m_bPassive )
 	{
-
-		// Expecting a reply?
-		if ( m_usecInFlightReplyTimeout )
+		if ( m_usecPeerAckedInstaneous + k_usecLinkStatsInstantaneousReportInterval < usecNow && BCheckHaveDataToSendInstantaneous( usecNow ) )
 		{
-			usecResult = std::min( usecResult, m_usecInFlightReplyTimeout );
+			if ( m_usecPeerAckedInstaneous + k_usecLinkStatsInstantaneousReportMaxInterval < usecNow )
+				nResult |= k_nSendStats_Instantanous_Due;
+			else
+				nResult |= k_nSendStats_Instantanous_Ready;
 		}
 
-		// Time when BNeedToSendPingImmediate will return true
-		if ( m_nReplyTimeoutsSinceLastRecv > 0 )
-			usecResult = std::min( usecResult, m_usecLastSendPacketExpectingImmediateReply+k_usecAggressivePingInterval );
-
-		// Time when we need to flush stats
-		if ( m_pktNumInFlight == 0 )
+		if ( m_usecPeerAckedLifetime + k_usecLinkStatsLifetimeReportInterval < usecNow && BCheckHaveDataToSendLifetime( usecNow ) )
 		{
-			usecResult = std::min( usecResult, m_usecPeerAckedInstaneous + k_usecLinkStatsInstantaneousReportMaxInterval );
-			usecResult = std::min( usecResult, m_usecPeerAckedLifetime + k_usecLinkStatsLifetimeReportMaxInterval );
+			if ( m_usecPeerAckedInstaneous + k_usecLinkStatsLifetimeReportMaxInterval < usecNow )
+				nResult |= k_nSendStats_Lifetime_Due;
+			else
+				nResult |= k_nSendStats_Lifetime_Ready;
 		}
 	}
 
-	return usecResult;
+	return nResult;
 }
 
-void LinkStatsTrackerBase::PopulateMessage( CMsgSteamDatagramConnectionQuality &msg, SteamNetworkingMicroseconds usecNow )
+const char *LinkStatsTrackerBase::InternalGetSendStatsReasonOrUpdateNextThinkTime( SteamNetworkingMicroseconds usecNow, const char *const arpszReasonStrings[4], SteamNetworkingMicroseconds &inOutNextThinkTime )
 {
-	if ( m_pktNumInFlight == 0 && !m_bPassive )
+	if ( m_bPassive )
+		return nullptr;
+	if ( m_usecInFlightReplyTimeout > 0 && m_usecInFlightReplyTimeout < inOutNextThinkTime )
+		inOutNextThinkTime = m_usecInFlightReplyTimeout;
+
+	// Message already in flight?
+	if ( m_pktNumInFlight )
+		return nullptr;
+
+	int n = 0;
+	if ( m_usecPeerAckedInstaneous + k_usecLinkStatsInstantaneousReportMaxInterval < usecNow && BCheckHaveDataToSendInstantaneous( usecNow ) )
 	{
+		n |= 1;
+	}
+	else
+	{
+		SteamNetworkingMicroseconds usecNextCheck = m_usecPeerAckedInstaneous + k_usecLinkStatsInstantaneousReportMaxInterval;
+		if ( usecNextCheck < inOutNextThinkTime )
+			inOutNextThinkTime = usecNextCheck;
+	}
+	if ( m_usecPeerAckedLifetime + k_usecLinkStatsLifetimeReportMaxInterval < usecNow && BCheckHaveDataToSendLifetime( usecNow ) )
+	{
+		n |= 2;
+	}
+	else
+	{
+		SteamNetworkingMicroseconds usecNextCheck = m_usecPeerAckedLifetime + k_usecLinkStatsLifetimeReportMaxInterval;
+		if ( usecNextCheck < inOutNextThinkTime )
+			inOutNextThinkTime = usecNextCheck;
+	}
+	return arpszReasonStrings[n];
+}
 
-		// Ready to send instantaneous stats?
-		if ( m_usecPeerAckedInstaneous + k_usecLinkStatsInstantaneousReportMinInterval < usecNow && BCheckHaveDataToSendInstantaneous( usecNow ) )
-		{
-			// !KLUDGE! Go through public struct as intermediary to keep code simple.
-			SteamDatagramLinkInstantaneousStats sInstant;
-			GetInstantaneousStats( sInstant );
-			LinkStatsInstantaneousStructToMsg( sInstant, *msg.mutable_instantaneous() );
-		}
+void LinkStatsTrackerBase::PopulateMessage( int nNeedFlags, CMsgSteamDatagramConnectionQuality &msg, SteamNetworkingMicroseconds usecNow )
+{
+	Assert( m_pktNumInFlight == 0 && !m_bPassive );
 
-		// Ready to send lifetime stats?
-		if ( m_usecPeerAckedLifetime + k_usecLinkStatsLifetimeReportMinInterval < usecNow && BCheckHaveDataToSendLifetime( usecNow ) )
-		{
-			PopulateLifetimeMessage( *msg.mutable_lifetime() );
-		}
+	// Ready to send instantaneous stats?
+	if ( nNeedFlags & k_nSendStats_Instantanous )
+	{
+		// !KLUDGE! Go through public struct as intermediary to keep code simple.
+		SteamDatagramLinkInstantaneousStats sInstant;
+		GetInstantaneousStats( sInstant );
+		LinkStatsInstantaneousStructToMsg( sInstant, *msg.mutable_instantaneous() );
+	}
+
+	// Ready to send lifetime stats?
+	if ( nNeedFlags & k_nSendStats_Lifetime )
+	{
+		PopulateLifetimeMessage( *msg.mutable_lifetime() );
 	}
 }
 
@@ -625,10 +572,10 @@ void LinkStatsTrackerBase::GetLifetimeStats( SteamDatagramLinkLifetimeStats &s )
 	s.m_nPacketsRecv = m_recv.m_packets.Total();
 	s.m_nBytesRecv = m_recv.m_bytes.Total();
 	s.m_nPktsRecvSequenced = m_nPktsRecvSequenced;
-	s.m_nPktsRecvDropped = m_nPktsRecvDropped;
-	s.m_nPktsRecvOutOfOrder = m_nPktsRecvOutOfOrder;
-	s.m_nPktsRecvDuplicate = m_nPktsRecvDuplicate;
-	s.m_nPktsRecvSequenceNumberLurch = m_nPktsRecvSequenceNumberLurch;
+	s.m_nPktsRecvDropped = PktsRecvDropped();
+	s.m_nPktsRecvOutOfOrder = PktsRecvOutOfOrder();
+	s.m_nPktsRecvDuplicate = PktsRecvDuplicate();
+	s.m_nPktsRecvSequenceNumberLurch = PktsRecvLurch();
 
 	s.m_qualityHistogram = m_qualityHistogram;
 
@@ -712,6 +659,9 @@ void LinkStatsTrackerEndToEnd::InitInternal( SteamNetworkingMicroseconds usecNow
 {
 	LinkStatsTrackerBase::InitInternal( usecNow );
 
+	m_usecWhenStartedConnectedState = 0;
+	m_usecWhenEndedConnectedState = 0;
+
 	m_TXSpeedSample.Clear();
 	m_nTXSpeed = 0;
 	m_nTXSpeedHistogram16 = 0; // Speed at kb/s
@@ -787,6 +737,16 @@ void LinkStatsTrackerEndToEnd::UpdateSpeeds( int nTXSpeed, int nRXSpeed )
 void LinkStatsTrackerEndToEnd::GetLifetimeStats( SteamDatagramLinkLifetimeStats &s ) const
 {
 	LinkStatsTrackerBase::GetLifetimeStats(s);
+
+	if ( m_usecWhenStartedConnectedState == 0 || m_usecWhenStartedConnectedState == m_usecWhenEndedConnectedState )
+	{
+		s.m_nConnectedSeconds = 0;
+	}
+	else
+	{
+		SteamNetworkingMicroseconds usecWhenEnded = m_usecWhenEndedConnectedState ? m_usecWhenEndedConnectedState : SteamNetworkingSockets_GetLocalTimestamp();
+		s.m_nConnectedSeconds = std::max( k_nMillion, usecWhenEnded - m_usecWhenStartedConnectedState + 500000 ) / k_nMillion;
+	}
 
 	s.m_nTXSpeedMax           = m_nTXSpeedMax;
 
@@ -872,6 +832,9 @@ void LinkStatsInstantaneousMsgToStruct( const CMsgSteamDatagramLinkInstantaneous
 
 void LinkStatsLifetimeStructToMsg( const SteamDatagramLinkLifetimeStats &s, CMsgSteamDatagramLinkLifetimeStats &msg )
 {
+	if ( s.m_nConnectedSeconds >= 0 )
+		msg.set_connected_seconds( s.m_nConnectedSeconds );
+
 	msg.set_packets_sent( s.m_nPacketsSent );
 	msg.set_kb_sent( ( s.m_nBytesSent + 512 ) / 1024 );
 	msg.set_packets_recv( s.m_nPacketsRecv );
@@ -965,6 +928,7 @@ void LinkStatsLifetimeStructToMsg( const SteamDatagramLinkLifetimeStats &s, CMsg
 
 void LinkStatsLifetimeMsgToStruct( const CMsgSteamDatagramLinkLifetimeStats &msg, SteamDatagramLinkLifetimeStats &s )
 {
+	s.m_nConnectedSeconds = msg.has_connected_seconds() ? msg.connected_seconds() : -1;
 	s.m_nPacketsSent = msg.packets_sent();
 	s.m_nBytesSent = msg.kb_sent() * 1024;
 	s.m_nPacketsRecv = msg.packets_recv();

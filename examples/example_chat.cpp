@@ -46,6 +46,7 @@ static void NukeProcess( int rc )
 	#ifdef WIN32
 		ExitProcess( rc );
 	#else
+		(void)rc; // Unused formal parameter
 		kill( getpid(), SIGKILL );
 	#endif
 }
@@ -227,7 +228,7 @@ bool LocalUserInput_GetNext( std::string &result )
 //
 /////////////////////////////////////////////////////////////////////////////
 
-class ChatServer : private ISteamNetworkingSocketsCallbacks
+class ChatServer
 {
 public:
 	void Run( uint16 nPort )
@@ -240,7 +241,9 @@ public:
 		SteamNetworkingIPAddr serverLocalAddr;
 		serverLocalAddr.Clear();
 		serverLocalAddr.m_port = nPort;
-		m_hListenSock = m_pInterface->CreateListenSocketIP( serverLocalAddr, 0, nullptr );
+		SteamNetworkingConfigValue_t opt;
+		opt.SetPtr( k_ESteamNetworkingConfig_Callback_ConnectionStatusChanged, (void*)SteamNetConnectionStatusChangedCallback );
+		m_hListenSock = m_pInterface->CreateListenSocketIP( serverLocalAddr, 1, &opt );
 		if ( m_hListenSock == k_HSteamListenSocket_Invalid )
 			FatalError( "Failed to listen on port %d", nPort );
 		m_hPollGroup = m_pInterface->CreatePollGroup();
@@ -357,11 +360,6 @@ private:
 		}
 	}
 
-	void PollConnectionStateChanges()
-	{
-		m_pInterface->RunCallbacks( this );
-	}
-
 	void PollLocalUserInput()
 	{
 		std::string cmd;
@@ -389,7 +387,7 @@ private:
 		m_pInterface->SetConnectionName( hConn, nick );
 	}
 
-	virtual void OnSteamNetConnectionStatusChanged( SteamNetConnectionStatusChangedCallback_t *pInfo ) override
+	void OnSteamNetConnectionStatusChanged( SteamNetConnectionStatusChangedCallback_t *pInfo )
 	{
 		char temp[1024];
 
@@ -531,7 +529,21 @@ private:
 				break;
 		}
 	}
+
+	static ChatServer *s_pCallbackInstance;
+	static void SteamNetConnectionStatusChangedCallback( SteamNetConnectionStatusChangedCallback_t *pInfo )
+	{
+		s_pCallbackInstance->OnSteamNetConnectionStatusChanged( pInfo );
+	}
+
+	void PollConnectionStateChanges()
+	{
+		s_pCallbackInstance = this;
+		m_pInterface->RunCallbacks();
+	}
 };
+
+ChatServer *ChatServer::s_pCallbackInstance = nullptr;
 
 /////////////////////////////////////////////////////////////////////////////
 //
@@ -539,7 +551,7 @@ private:
 //
 /////////////////////////////////////////////////////////////////////////////
 
-class ChatClient : private ISteamNetworkingSocketsCallbacks
+class ChatClient
 {
 public:
 	void Run( const SteamNetworkingIPAddr &serverAddr )
@@ -551,7 +563,9 @@ public:
 		char szAddr[ SteamNetworkingIPAddr::k_cchMaxString ];
 		serverAddr.ToString( szAddr, sizeof(szAddr), true );
 		Printf( "Connecting to chat server at %s", szAddr );
-		m_hConnection = m_pInterface->ConnectByIPAddress( serverAddr, 0, nullptr );
+		SteamNetworkingConfigValue_t opt;
+		opt.SetPtr( k_ESteamNetworkingConfig_Callback_ConnectionStatusChanged, (void*)SteamNetConnectionStatusChangedCallback );
+		m_hConnection = m_pInterface->ConnectByIPAddress( serverAddr, 1, &opt );
 		if ( m_hConnection == k_HSteamNetConnection_Invalid )
 			FatalError( "Failed to create connection" );
 
@@ -588,11 +602,6 @@ private:
 		}
 	}
 
-	void PollConnectionStateChanges()
-	{
-		m_pInterface->RunCallbacks( this );
-	}
-
 	void PollLocalUserInput()
 	{
 		std::string cmd;
@@ -618,7 +627,7 @@ private:
 		}
 	}
 
-	virtual void OnSteamNetConnectionStatusChanged( SteamNetConnectionStatusChangedCallback_t *pInfo ) override
+	void OnSteamNetConnectionStatusChanged( SteamNetConnectionStatusChangedCallback_t *pInfo )
 	{
 		assert( pInfo->m_hConn == m_hConnection || m_hConnection == k_HSteamNetConnection_Invalid );
 
@@ -676,7 +685,21 @@ private:
 				break;
 		}
 	}
+
+	static ChatClient *s_pCallbackInstance;
+	static void SteamNetConnectionStatusChangedCallback( SteamNetConnectionStatusChangedCallback_t *pInfo )
+	{
+		s_pCallbackInstance->OnSteamNetConnectionStatusChanged( pInfo );
+	}
+
+	void PollConnectionStateChanges()
+	{
+		s_pCallbackInstance = this;
+		m_pInterface->RunCallbacks();
+	}
 };
+
+ChatClient *ChatClient::s_pCallbackInstance = nullptr;
 
 const uint16 DEFAULT_SERVER_PORT = 27020;
 

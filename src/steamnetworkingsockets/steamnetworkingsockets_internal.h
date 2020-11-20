@@ -44,7 +44,7 @@
 #include <tier0/basetypes.h>
 #include <tier0/t0constants.h>
 #include <tier0/platform.h>
-#include <tier0/dbgflag.h>
+#include <tier0/dbg.h>
 #ifdef STEAMNETWORKINGSOCKETS_STEAMCLIENT
 	#include <tier0/validator.h>
 #endif
@@ -59,12 +59,39 @@
 #include <steamnetworkingsockets_messages_certs.pb.h>
 #include <steam/isteamnetworkingutils.h> // for the rendering helpers
 
-// Running against Steam?  Then we have some default signaling.
-// Otherwise, we don't
-#ifdef STEAMNETWORKINGSOCKETS_STEAM
-	#define STEAMNETWORKINGSOCKETS_HAS_DEFAULT_P2P_SIGNALING
+#include <tier0/memdbgon.h>
+
+#ifdef STEAMNETWORKINGSOCKETS_ENABLE_MEM_OVERRIDE
+	#define STEAMNETWORKINGSOCKETS_DECLARE_CLASS_OPERATOR_NEW \
+		static void* operator new( size_t s ) noexcept { return malloc( s ); } \
+		static void* operator new[]( size_t ) = delete; \
+		static void operator delete( void *p ) noexcept { free( p ); } \
+		static void operator delete[]( void * ) = delete;
+#else
+	#define STEAMNETWORKINGSOCKETS_DECLARE_CLASS_OPERATOR_NEW
 #endif
 
+// Enable SDR, except in opensource build
+#ifndef STEAMNETWORKINGSOCKETS_OPENSOURCE
+	#define STEAMNETWORKINGSOCKETS_ENABLE_SDR
+#endif
+
+// Let's always enable ISteamNetworkingMessages for now.
+// Later we might provide a way to remove this code.
+#define STEAMNETWORKINGSOCKETS_ENABLE_STEAMNETWORKINGMESSAGES
+
+#if !defined( STEAMNETWORKINGSOCKETS_OPENSOURCE ) && !defined( STEAMNETWORKINGSOCKETS_STREAMINGCLIENT )
+	// STEAMNETWORKINGSOCKETS_CAN_REQUEST_CERT means we know how to make a cert request from some sort of certificate authority
+	#define STEAMNETWORKINGSOCKETS_CAN_REQUEST_CERT
+#endif
+
+// Always #define STEAMNETWORKINGSOCKETS_ENABLE_ICE, except in the opensource build.
+// There, it must go on the command line
+#ifndef STEAMNETWORKINGSOCKETS_ENABLE_ICE
+	#ifndef STEAMNETWORKINGSOCKETS_OPENSOURCE
+		#define STEAMNETWORKINGSOCKETS_ENABLE_ICE
+	#endif
+#endif
 
 // Redefine the macros for byte-swapping, to sure the correct
 // argument size.  We probably should move this into platform.h,
@@ -196,6 +223,9 @@ const int k_cbSteamNetworkingSocketsMaxPlaintextPayloadSend = k_cbSteamNetworkin
 const int k_cbSteamNetworkingSocketsMaxEncryptedPayloadRecv = k_cbSteamNetworkingSocketsMaxUDPMsgLen;
 const int k_cbSteamNetworkingSocketsMaxPlaintextPayloadRecv = k_cbSteamNetworkingSocketsMaxUDPMsgLen;
 
+/// If we have a cert that is going to expire in <N secondws, try to renew it
+const int k_nSecCertExpirySeekRenew = 3600*2;
+
 /// Make sure we have enough room for our headers and occasional inline pings and stats and such
 /// FIXME - For relayed connections, we send some of the stats outside the encrypted block, so that
 /// they can be observed by the relay.  For direct connections, we put it in the encrypted block.
@@ -276,10 +306,13 @@ COMPILE_TIME_ASSERT( ( k_usecTimeSinceLastPacketMaxReasonable >> k_usecTimeSince
 /// should be a bit higher that our serialization precision.
 const SteamNetworkingMicroseconds k_usecTimeSinceLastPacketMinReasonable = 2 << k_usecTimeSinceLastPacketSerializedPrecisionShift;
 
+/// A really terrible ping score, but one that we can do some math with without overflowing
+constexpr int k_nRouteScoreHuge = INT_MAX/8;
+
 /// Protocol version of this code.  This is a blunt instrument, which is incremented when we
 /// wish to change the wire protocol in a way that doesn't have some other easy
 /// mechanism for dealing with compatibility (e.g. using protobuf's robust mechanisms).
-const uint32 k_nCurrentProtocolVersion = 9;
+const uint32 k_nCurrentProtocolVersion = 10;
 
 /// Minimum required version we will accept from a peer.  We increment this
 /// when we introduce wire breaking protocol changes and do not wish to be
@@ -287,6 +320,10 @@ const uint32 k_nCurrentProtocolVersion = 9;
 /// but once we make a big public release, we probably won't ever be able to
 /// do this again, and we'll need to have more sophisticated mechanisms. 
 const uint32 k_nMinRequiredProtocolVersion = 8;
+
+/// SteamNetworkingMessages is built on top of SteamNetworkingSockets.  We use a reserved
+/// virtual port for this interface
+const int k_nVirtualPort_Messages = 0x7fffffff;
 
 // Serialize an UNSIGNED quantity.  Returns pointer to the next byte.
 // https://developers.google.com/protocol-buffers/docs/encoding
@@ -483,6 +520,22 @@ inline void NetAdrToSteamNetworkingIPAddr( SteamNetworkingIPAddr &addr, const ne
 	addr.m_port = netadr.GetPort();
 }
 
+inline bool AddrEqual( const SteamNetworkingIPAddr &s, const netadr_t &n )
+{
+	if ( s.m_port != n.GetPort() )
+		return false;
+	switch ( n.GetType() )
+	{
+		case k_EIPTypeV4:
+			return s.GetIPv4() == n.GetIPv4();
+
+		case k_EIPTypeV6:
+			return memcmp( s.m_ipv6, n.GetIPV6Bytes(), 16 ) == 0;
+	}
+
+	return false;
+}
+
 template <typename T>
 inline int64 NearestWithSameLowerBits( T nLowerBits, int64 nReference )
 {
@@ -559,15 +612,32 @@ struct ConfigValueBase
 	// Config value we should inherit from, if we are not set
 	ConfigValueBase *m_pInherit = nullptr;
 
+	enum EState
+	{
+		kENotSet,
+		kESet,
+		kELocked,
+	};
+
 	// Is the value set?
-	bool m_bValueSet = false;
+	EState m_eState = kENotSet;
+
+	inline bool IsLocked() const { return m_eState == kELocked; }
+	inline bool IsSet() const { return m_eState > kENotSet; }
+
+	// Unlock, if we are locked
+	inline void Unlock()
+	{
+		if ( m_eState == kELocked )
+			m_eState = kESet;
+	}
 };
 
 template<typename T>
 struct ConfigValue : public ConfigValueBase
 {
 	inline ConfigValue() : m_data{} {}
-	inline explicit ConfigValue( const T &defaultValue ) : m_data(defaultValue) { m_bValueSet = true; }
+	inline explicit ConfigValue( const T &defaultValue ) : m_data(defaultValue) { m_eState = kESet; }
 
 	T m_data;
 
@@ -575,7 +645,7 @@ struct ConfigValue : public ConfigValueBase
 	inline const T &Get() const
 	{
 		const ConfigValueBase *p = this;
-		while ( !p->m_bValueSet )
+		while ( !p->IsSet() )
 		{
 			Assert( p->m_pInherit );
 			p = p->m_pInherit;
@@ -585,10 +655,19 @@ struct ConfigValue : public ConfigValueBase
 		return t->m_data;
 	}
 
-	void Set( const T &value )
+	inline void Set( const T &value )
 	{
+		Assert( !IsLocked() );
 		m_data = value;
-		m_bValueSet = true;
+		m_eState = kESet;
+	}
+
+	// Lock in the current value
+	inline void Lock()
+	{
+		if ( !IsSet() )
+			m_data = Get();
+		m_eState = kELocked;
 	}
 };
 
@@ -597,7 +676,7 @@ template <> struct ConfigDataTypeTraits<int32> { const static ESteamNetworkingCo
 template <> struct ConfigDataTypeTraits<int64> { const static ESteamNetworkingConfigDataType k_eDataType = k_ESteamNetworkingConfig_Int64; };
 template <> struct ConfigDataTypeTraits<float> { const static ESteamNetworkingConfigDataType k_eDataType = k_ESteamNetworkingConfig_Float; };
 template <> struct ConfigDataTypeTraits<std::string> { const static ESteamNetworkingConfigDataType k_eDataType = k_ESteamNetworkingConfig_String; };
-template <> struct ConfigDataTypeTraits<void*> { const static ESteamNetworkingConfigDataType k_eDataType = k_ESteamNetworkingConfig_FunctionPtr; };
+template <> struct ConfigDataTypeTraits<void*> { const static ESteamNetworkingConfigDataType k_eDataType = k_ESteamNetworkingConfig_Ptr; };
 
 struct GlobalConfigValueEntry
 {
@@ -655,7 +734,7 @@ struct GlobalConfigValueBase : GlobalConfigValueEntry
 	inline const T &Get() const
 	{
 		Assert( !m_value.m_pInherit );
-		Assert( m_value.m_bValueSet );
+		Assert( m_value.IsSet() );
 		return m_value.m_data;
 	}
 
@@ -687,20 +766,26 @@ struct ConnectionConfig
 	ConfigValue<int32> m_NagleTime;
 	ConfigValue<int32> m_IP_AllowWithoutAuth;
 	ConfigValue<int32> m_Unencrypted;
+	ConfigValue<int32> m_SymmetricConnect;
+	ConfigValue<int32> m_LocalVirtualPort;
 
 	ConfigValue<int32> m_LogLevel_AckRTT;
 	ConfigValue<int32> m_LogLevel_PacketDecode;
 	ConfigValue<int32> m_LogLevel_Message;
 	ConfigValue<int32> m_LogLevel_PacketGaps;
+	ConfigValue<int32> m_LogLevel_P2PRendezvous;
+
+	ConfigValue<void *> m_Callback_ConnectionStatusChanged;
 
 	#ifdef STEAMNETWORKINGSOCKETS_ENABLE_ICE
 		ConfigValue<std::string> m_P2P_STUN_ServerList;
+		ConfigValue<int32> m_P2P_Transport_ICE_Enable;
+		ConfigValue<int32> m_P2P_Transport_ICE_Penalty;
 	#endif
-
-	ConfigValue<int32> m_LogLevel_P2PRendezvous;
 
 	#ifdef STEAMNETWORKINGSOCKETS_ENABLE_SDR
 		ConfigValue<std::string> m_SDRClient_DebugTicketAddress;
+		ConfigValue<int32> m_P2P_Transport_SDR_Penalty;
 	#endif
 
 	void Init( ConnectionConfig *pInherit );
@@ -726,6 +811,12 @@ extern GlobalConfigValue<float> g_Config_FakePacketDup_Send;
 extern GlobalConfigValue<float> g_Config_FakePacketDup_Recv;
 extern GlobalConfigValue<int32> g_Config_FakePacketDup_TimeMax;
 extern GlobalConfigValue<int32> g_Config_EnumerateDevVars;
+extern GlobalConfigValue<void*> g_Config_Callback_CreateConnectionSignaling;
+
+#ifdef STEAMNETWORKINGSOCKETS_ENABLE_STEAMNETWORKINGMESSAGES
+extern GlobalConfigValue<void*> g_Config_Callback_MessagesSessionRequest;
+extern GlobalConfigValue<void*> g_Config_Callback_MessagesSessionFailed;
+#endif
 
 #ifdef STEAMNETWORKINGSOCKETS_ENABLE_SDR
 extern GlobalConfigValue<int32> g_Config_SDRClient_ConsecutitivePingTimeoutsFailInitial;
@@ -760,6 +851,61 @@ inline bool RandomBoolWithOdds( float odds )
 }
 
 } // namespace SteamNetworkingSocketsLib
+
+#include <tier0/memdbgon.h>
+
+// Set paranoia level, if not already set:
+// 0 = disabled
+// 1 = sometimes
+// 2 = max
+#ifndef STEAMNETWORKINGSOCKETS_SNP_PARANOIA
+	#ifdef _DEBUG
+		#define STEAMNETWORKINGSOCKETS_SNP_PARANOIA 2
+	#else
+		#define STEAMNETWORKINGSOCKETS_SNP_PARANOIA 0
+	#endif
+#endif
+
+#if ( STEAMNETWORKINGSOCKETS_SNP_PARANOIA > 0 ) && ( defined(__GNUC__ ) && defined( __linux__ ) && !defined( __ANDROID__ ) )
+	#define STEAMNETWORKINGSOCKETS_USE_GNU_DEBUG_MAP
+	#include <debug/map>
+#endif
+
+// Declare std_vector and std_map in our namespace.  They use debug versions when available,
+// a custom allocator
+namespace SteamNetworkingSocketsLib
+{
+
+	// Custom allocator that use malloc/free (and right now, those are #defines
+	// that go to our own functions if we are overriding memory allocation.)
+	#ifdef STEAMNETWORKINGSOCKETS_ENABLE_MEM_OVERRIDE
+		template <typename T>
+		struct Allocator
+		{
+			using value_type = T;
+			Allocator() noexcept = default;
+			template<class U> Allocator(const Allocator<U>&) noexcept {}
+			template<class U> bool operator==(const Allocator<U>&) const noexcept { return true; }
+			template<class U> bool operator!=(const Allocator<U>&) const noexcept { return false; }
+			static T* allocate( size_t n ) { return (T*)malloc( n *sizeof(T) ); }
+			static void deallocate( T *p, size_t n ) { free( p ); }
+		};
+	#else
+		template <typename T> using Allocator = std::allocator<T>;
+	#endif
+
+	#ifdef STEAMNETWORKINGSOCKETS_USE_GNU_DEBUG_MAP
+		// Use debug version of std::map
+		template< typename K, typename V, typename L = std::less<K> >
+		using std_map = __gnu_debug::map<K,V,L, Allocator< std::pair<const K, V> > >;
+	#else
+		template< typename K, typename V, typename L = std::less<K> >
+		using std_map = std::map<K,V,L,Allocator< std::pair<const K, V> >>;
+	#endif
+
+	template< typename T >
+	using std_vector = std::vector<T, Allocator<T> >;
+}
 
 //
 // Some misc tools for using std::vector that our CUtlVector class had
@@ -859,6 +1005,14 @@ inline int len( const std::map<K,V,L,A> &map )
 	return (int)map.size();
 }
 
+#ifdef STEAMNETWORKINGSOCKETS_USE_GNU_DEBUG_MAP
+	template <typename K, typename V, typename L, typename A>
+	inline int len( const __gnu_debug::map<K,V,L,A> &map )
+	{
+		return (int)map.size();
+	}
+#endif
+
 template <typename T, typename L, typename A>
 inline int len( const std::set<T,L,A> &map )
 {
@@ -907,7 +1061,7 @@ namespace vstd
 		{
 			T *dest_end = dest+n;
 			while ( dest < dest_end )
-				new (dest++) T( *(src++) );
+				Construct<T>( dest++, *(src++) );
 		}
 	}
 
@@ -922,7 +1076,7 @@ namespace vstd
 		{
 			T *dest_end = dest+n;
 			while ( dest < dest_end )
-				new (dest++) T( std::move( *(src++) ) );
+				Construct( dest++, std::move( *(src++) ) );
 		}
 	}
 
@@ -1029,7 +1183,7 @@ namespace vstd
 	{
 		if ( size_ >= capacity_ )
 			reserve( size_*2  +  (63+sizeof(T))/sizeof(T) );
-		new ( begin() + size_ ) T ( value );
+		Construct<T>( begin() + size_, value );
 		++size_;
 	}
 
@@ -1070,6 +1224,7 @@ namespace vstd
 	{
 		if ( n <= capacity_ )
 			return;
+		assert( capacity_ >= size_ );
 		if ( std::is_trivial<T>::value && dynamic_ )
 		{
 			dynamic_ = (T*)realloc( dynamic_, n * sizeof(T) );
@@ -1077,11 +1232,15 @@ namespace vstd
 		else
 		{
 			T *new_dynamic = (T *)malloc( n * sizeof(T) );
-			T *e = end();
-			for ( T *s = begin(), *d = new_dynamic ; s < e ; ++s, ++d )
+			T *s = begin();
+			T *e = s + size_;
+			T *d = new_dynamic;
+			while ( s < e )
 			{
-				new ( d ) T ( std::move( *s ) );
+				Construct<T>( d, std::move( *s ) );
 				s->~T();
+				++s;
+				++d;
 			}
 			if ( dynamic_ )
 				::free( dynamic_ );
@@ -1099,7 +1258,7 @@ namespace vstd
 			T *b = begin();
 			while ( size_ < n )
 			{
-				new ( b ) T;
+				Construct<T>( b ); // NOTE: Does not use value initializer, so PODs are *not* initialized
 				++b;
 				++size_;
 			}
@@ -1185,7 +1344,7 @@ namespace vstd
 
 			// Use copy constructor for any remaining items
 			while ( s < srcEnd )
-				new (d++) T( *(s++) );
+				Construct<T>( d++, *(s++) );
 		}
 		size_ = n;
 	}
@@ -1194,8 +1353,5 @@ namespace vstd
 	struct LikeStdVectorTraits< small_vector<T,N> > { enum { yes = 1 }; typedef T ElemType; };
 
 } // namespace vstd
-
-
-#include <tier0/memdbgon.h>
 
 #endif // STEAMNETWORKINGSOCKETS_INTERNAL_H

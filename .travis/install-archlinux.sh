@@ -10,7 +10,9 @@ PACKAGES=(
 	ccache
 	clang
 	cmake
-	meson
+	git
+	go
+	ninja
 )
 
 PACKAGES+=(protobuf)

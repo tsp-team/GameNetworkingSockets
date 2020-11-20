@@ -13,6 +13,7 @@
 #include "percentile_generator.h"
 #include "steamnetworking_stats.h"
 #include "steamnetworkingsockets_internal.h"
+#include "steamnetworkingsockets_thinker.h"
 
 //#include <google/protobuf/repeated_field.h> // FIXME - should only need this!
 #include <tier0/memdbgoff.h>
@@ -40,12 +41,10 @@ const SteamNetworkingMicroseconds k_usecLinkStatsMaxPingRequestInterval = 7 * k_
 
 /// Client should send instantaneous connection quality stats
 /// at approximately this interval
-const SteamNetworkingMicroseconds k_usecLinkStatsInstantaneousReportMinInterval = 17 * k_nMillion;
 const SteamNetworkingMicroseconds k_usecLinkStatsInstantaneousReportInterval = 20 * k_nMillion;
 const SteamNetworkingMicroseconds k_usecLinkStatsInstantaneousReportMaxInterval = 30 * k_nMillion;
 
 /// Client will report lifetime connection stats at approximately this interval
-const SteamNetworkingMicroseconds k_usecLinkStatsLifetimeReportMinInterval = 102 * k_nMillion;
 const SteamNetworkingMicroseconds k_usecLinkStatsLifetimeReportInterval = 120 * k_nMillion;
 const SteamNetworkingMicroseconds k_usecLinkStatsLifetimeReportMaxInterval = 140 * k_nMillion;
 
@@ -138,7 +137,10 @@ struct PingTracker
 	/// Estimate a conservative (i.e. err on the large side) timeout for the connection
 	SteamNetworkingMicroseconds CalcConservativeTimeout() const
 	{
-		return ( m_nSmoothedPing >= 0 ) ? ( WorstPingInRecentSample()*2000 + 250000 ) : k_nMillion;
+		constexpr SteamNetworkingMicroseconds k_usecMaxTimeout = 1250000;
+		if ( m_nSmoothedPing < 0 )
+			return k_usecMaxTimeout;
+		return std::min( SteamNetworkingMicroseconds{ WorstPingInRecentSample()*2000 + 250000 }, k_usecMaxTimeout );
 	}
 
 	/// Smoothed ping value
@@ -192,21 +194,148 @@ struct PingTrackerDetailed : PingTracker
 	}
 };
 
-/// Track minimal ping information
-struct PingTrackerBasic : PingTracker
-{
-	int m_nTotalPingsReceived;
+/// Before switching to a different route, we need to make sure that we have a ping
+/// sample in at least N recent time buckets.  (See PingTrackerForRouteSelection)
+const int k_nRecentValidTimeBucketsToSwitchRoute = 15;
 
-	inline void Reset()
+/// Ping tracker that tracks samples over several intervals.  This is used
+/// to make routing decisions in such a way to avoid route flapping when ping
+/// times on different routes are fluctuating.
+///
+/// This class also has the concept of a user override, which is used to fake
+/// a particular ping time for debugging.
+struct PingTrackerForRouteSelection : PingTracker
+{
+	COMPILE_TIME_ASSERT( k_nRecentValidTimeBucketsToSwitchRoute == 15 );
+	static constexpr int k_nTimeBucketCount = 17;
+	static constexpr SteamNetworkingMicroseconds k_usecTimeBucketWidth = k_nMillion; // Desired width of each time bucket
+	static constexpr int k_nPingOverride_None = -2; // Ordinary operation.  (-1 is a legit ping time, which means "ping failed")
+	static constexpr SteamNetworkingMicroseconds k_usecAntiFlapRouteCheckPingInterval = 200*1000;
+
+	struct TimeBucket
+	{
+		SteamNetworkingMicroseconds m_usecEnd; // End of this bucket.  The start of the bucket is m_usecEnd-k_usecTimeBucketWidth
+		int m_nPingCount;
+		int m_nMinPing; // INT_NAX if we have not received one
+		int m_nMaxPing; // INT_MIN
+	};
+	TimeBucket m_arTimeBuckets[ k_nTimeBucketCount ];
+	int m_idxCurrentBucket;
+	int m_nTotalPingsReceived;
+	int m_nPingOverride = k_nPingOverride_None;
+
+	void Reset()
 	{
 		PingTracker::Reset();
 		m_nTotalPingsReceived = 0;
+		m_idxCurrentBucket = 0;
+		for ( TimeBucket &b: m_arTimeBuckets )
+		{
+			b.m_usecEnd = 0;
+			b.m_nPingCount = 0;
+			b.m_nMinPing = INT_MAX;
+			b.m_nMaxPing = INT_MIN;
+		}
 	}
-
-	inline void ReceivedPing( int nPingMS, SteamNetworkingMicroseconds usecNow )
+	void ReceivedPing( int nPingMS, SteamNetworkingMicroseconds usecNow )
 	{
+		// Ping time override in effect?
+		if ( m_nPingOverride > k_nPingOverride_None )
+		{
+			if ( m_nPingOverride == -1 )
+				return;
+			nPingMS = m_nPingOverride;
+		}
 		PingTracker::ReceivedPing( nPingMS, usecNow );
 		++m_nTotalPingsReceived;
+
+		SteamNetworkingMicroseconds usecCurrentBucketEnd = m_arTimeBuckets[ m_idxCurrentBucket ].m_usecEnd;
+		if ( usecCurrentBucketEnd > usecNow )
+		{
+			TimeBucket &curBucket = m_arTimeBuckets[ m_idxCurrentBucket ];
+			++curBucket.m_nPingCount;
+			curBucket.m_nMinPing = std::min( curBucket.m_nMinPing, nPingMS );
+			curBucket.m_nMaxPing = std::max( curBucket.m_nMaxPing, nPingMS );
+		}
+		else
+		{
+			++m_idxCurrentBucket;
+			if ( m_idxCurrentBucket >= k_nTimeBucketCount )
+				m_idxCurrentBucket = 0;
+			TimeBucket &newBucket = m_arTimeBuckets[ m_idxCurrentBucket ];
+
+			// If we are less than halfway into the new window, then start it immediately after
+			// the previous one.
+			if ( usecCurrentBucketEnd + (k_usecTimeBucketWidth/2) >= usecNow )
+			{
+				newBucket.m_usecEnd = usecCurrentBucketEnd + k_usecTimeBucketWidth;
+			}
+			else
+			{
+				// It's been more than half a window.  Start this window at the current time.
+				newBucket.m_usecEnd = usecNow + k_usecTimeBucketWidth;
+			}
+
+			newBucket.m_nPingCount = 1;
+			newBucket.m_nMinPing = nPingMS;
+			newBucket.m_nMaxPing = nPingMS;
+		}
+	}
+
+	void SetPingOverride( int nPing )
+	{
+		m_nPingOverride = nPing;
+		if ( m_nPingOverride <= k_nPingOverride_None )
+			return;
+		if ( m_nPingOverride < 0 )
+		{
+			m_nValidPings = 0;
+			m_nSmoothedPing = -1;
+			return;
+		}
+		m_nSmoothedPing = nPing;
+		for ( int i = 0 ; i < m_nValidPings ; ++i )
+			m_arPing[i].m_nPingMS = nPing;
+		TimeBucket &curBucket = m_arTimeBuckets[ m_idxCurrentBucket ];
+		curBucket.m_nMinPing = nPing;
+		curBucket.m_nMaxPing = nPing;
+	}
+
+	/// Return true if the next ping received will start a new bucket
+	SteamNetworkingMicroseconds TimeToSendNextAntiFlapRouteCheckPingRequest() const
+	{
+		return std::min(
+			m_arTimeBuckets[ m_idxCurrentBucket ].m_usecEnd, // time to start next bucket
+			m_usecTimeLastSentPingRequest + k_usecAntiFlapRouteCheckPingInterval // and then send them at a given rate
+		);
+	}
+
+	// Get the min/max ping value among recent buckets.
+	// Returns the number of valid buckets used to collect the data.
+	int GetPingRangeFromRecentBuckets( int &nOutMin, int &nOutMax, SteamNetworkingMicroseconds usecNow ) const
+	{
+		int nMin = m_nSmoothedPing;
+		int nMax = m_nSmoothedPing;
+		int nBucketsValid = 0;
+		if ( m_nSmoothedPing >= 0 )
+		{
+			SteamNetworkingMicroseconds usecRecentEndThreshold = usecNow - ( (k_nTimeBucketCount-1) * k_usecTimeBucketWidth );
+			for ( const TimeBucket &bucket: m_arTimeBuckets )
+			{
+				if ( bucket.m_usecEnd >= usecRecentEndThreshold )
+				{
+					Assert( bucket.m_nPingCount > 0 );
+					Assert( 0 <= bucket.m_nMinPing );
+					Assert( bucket.m_nMinPing <= bucket.m_nMaxPing );
+					++nBucketsValid;
+					nMin = std::min( nMin, bucket.m_nMinPing );
+					nMax = std::max( nMax, bucket.m_nMaxPing );
+				}
+			}
+		}
+		nOutMin = nMin;
+		nOutMax = nMax;
+		return nBucketsValid;
 	}
 };
 
@@ -255,6 +384,89 @@ private:
 	/// The degree to which the bucket is not full.  E.g. 0 is "full" and any higher number means they are less than full.
 	/// Doing the accounting in this "inverted" way makes it easier to reset and adjust the limits dynamically.
 	float m_flTokenDeficitFromFull;
+};
+
+// Bitmask returned by GetStatsSendNeed
+constexpr int k_nSendStats_Instantanous_Due = 1;
+constexpr int k_nSendStats_Instantanous_Ready = 2;
+constexpr int k_nSendStats_Lifetime_Due = 4;
+constexpr int k_nSendStats_Lifetime_Ready = 8;
+constexpr int k_nSendStats_Instantanous = k_nSendStats_Instantanous_Due|k_nSendStats_Instantanous_Ready;
+constexpr int k_nSendStats_Lifetime = k_nSendStats_Lifetime_Due|k_nSendStats_Lifetime_Ready;
+constexpr int k_nSendStats_Due = k_nSendStats_Instantanous_Due|k_nSendStats_Lifetime_Due;
+constexpr int k_nSendStats_Ready = k_nSendStats_Instantanous_Ready|k_nSendStats_Lifetime_Ready;
+
+/// Track quality stats based on flow of sequence numbers
+struct SequencedPacketCounters
+{
+	int m_nRecv; // packets successfully received containing a sequence number
+	int m_nDropped; // packets assumed to be dropped in the current interval
+	int m_nOutOfOrder; // any sequence number deviation other than a simple dropped packet.  (Most recent interval.)
+	int m_nLurch; // any sequence number deviation other than a simple dropped packet.  (Most recent interval.)
+	int m_nDuplicate; // any sequence number deviation other than a simple dropped packet.  (Most recent interval.)
+	int m_usecMaxJitter;
+
+	void Reset()
+	{
+		m_nRecv = 0;
+		m_nDropped = 0;
+		m_nOutOfOrder = 0;
+		m_nLurch = 0;
+		m_nDuplicate = 0;
+		m_usecMaxJitter = -1;
+	}
+
+	void Accumulate( const SequencedPacketCounters &x )
+	{
+		m_nRecv += x.m_nRecv;
+		m_nDropped += x.m_nDropped;
+		m_nOutOfOrder += m_nOutOfOrder;
+		m_nLurch += m_nLurch;
+		m_nDuplicate += x.m_nDuplicate;
+		m_usecMaxJitter = std::max( m_usecMaxJitter, x.m_usecMaxJitter );
+	}
+
+	inline int Weird() const { return m_nOutOfOrder + m_nLurch + m_nDuplicate; }
+
+	static inline float CalculateQuality( int nRecv, int nDropped, int nWeird )
+	{
+		Assert( nRecv >= nWeird );
+		int nSent = nRecv + nDropped;
+		if ( nSent <= 0 )
+			return -1.0f;
+		return (float)(nRecv - nWeird) / (float)nSent;
+	}
+
+	inline float CalculateQuality() const
+	{
+		return CalculateQuality( m_nRecv, m_nDropped, Weird() );
+	}
+
+	inline void OnRecv()
+	{
+		++m_nRecv;
+	}
+	inline void OnDropped( int nDropped )
+	{
+		m_nDropped += nDropped;
+	}
+	inline void OnDuplicate()
+	{
+		++m_nDuplicate;
+	}
+	inline void OnLurch()
+	{
+		++m_nLurch;
+	}
+	inline void OnOutOfOrder()
+	{
+		++m_nOutOfOrder;
+
+		// We previously marked this as dropped.  Undo that
+		if ( m_nDropped > 0 ) // Might have marked it in the previous interval.  Our stats will be slightly off in this case.  Not worth it to try to get this exactly right.
+			--m_nDropped;
+	}
+
 };
 
 
@@ -321,9 +533,19 @@ struct LinkStatsTrackerBase
 	/// Packet and data rate trackers for inbound flow
 	PacketRate_t m_recv;
 
+	// TEMP delete this once I track down the accounting bug
+	int64 m_nDebugLastInitMaxRecvPktNum;
+	int64 m_nDebugPktsRecvInOrder;
+	int64 m_arDebugHistoryRecvSeqNum[ 256 ];
+	std::string HistoryRecvSeqNumDebugString( int nMaxPkts ) const;
+
 	/// Setup state to expect the next packet to be nPktNum+1,
 	/// and discard all packets <= nPktNum
 	void InitMaxRecvPktNum( int64 nPktNum );
+	void ResetMaxRecvPktNumForIncomingWirePktNum( uint16 nPktNum )
+	{
+		InitMaxRecvPktNum( (int64)(uint16)( nPktNum - 1 ) );
+	}
 
 	/// Bitmask of recently received packets, used to reject duplicate packets.
 	/// (Important for preventing replay attacks.)
@@ -335,18 +557,8 @@ struct LinkStatsTrackerBase
 	/// corresponds to B - 64 + n.
 	uint64 m_recvPktNumberMask[2];
 
-	/// Called when we receive a packet with a sequence number.
-	/// This expands the wire packet number to its full value,
-	/// and checks if it is a duplicate or out of range.
-	/// Stats are also updated
-	int64 ExpandWirePacketNumberAndCheck( uint16 nWireSeqNum )
-	{
-		int16 nGap = (int16)( nWireSeqNum - (uint16)m_nMaxRecvPktNum );
-		int64 nPktNum = m_nMaxRecvPktNum + nGap;
-		if ( !BCheckPacketNumberOldOrDuplicate( nPktNum ) )
-			return 0;
-		return nPktNum;
-	}
+	/// Get string describing state of recent packets received.
+	std::string RecvPktNumStateDebugString() const;
 
 	/// Packets that we receive that exceed the rate limit.
 	/// (We might drop these, or we might just want to be interested in how often it happens.)
@@ -369,37 +581,28 @@ struct LinkStatsTrackerBase
 		m_usecWhenTimeoutStarted = 0;
 	}
 
-	/// Called when we have processed a packet with a sequence number, to update estimated
-	/// number of dropped packets, etc.  This MUST only be called after we have
-	/// called ExpandWirePacketNumberAndCheck, to ensure that the packet number is not a
-	/// duplicate or out of range.
-	void TrackProcessSequencedPacket( int64 nPktNum, SteamNetworkingMicroseconds usecNow, int usecSenderTimeSincePrev );
-
 	//
-	// Instantaneous stats
+	// Quality metrics stats
 	//
 
-	// Accumulators for current interval
-	int m_nPktsRecvSequencedCurrentInterval; // packets successfully received containing a sequence number
-	int m_nPktsRecvDroppedCurrentInterval; // packets assumed to be dropped in the current interval
-	int m_nPktsRecvWeirdSequenceCurrentInterval; // any sequence number deviation other than a simple dropped packet.  (Most recent interval.)
-	int m_usecMaxJitterCurrentInterval;
+	// Track instantaneous rate of number of sequence number anomalies
+	SequencedPacketCounters m_seqPktCounters;
 
 	// Instantaneous rates, calculated from most recent completed interval
 	float m_flInPacketsDroppedPct;
 	float m_flInPacketsWeirdSequencePct;
 	int m_usecMaxJitterPreviousInterval;
 
-	//
-	// Lifetime stats
-	//
-
-	// Lifetime counters
+	// Lifetime counters.  The "accumulator" values do not include the current interval -- use the accessors to get those
 	int64 m_nPktsRecvSequenced;
-	int64 m_nPktsRecvDropped;
-	int64 m_nPktsRecvOutOfOrder;
-	int64 m_nPktsRecvDuplicate;
-	int64 m_nPktsRecvSequenceNumberLurch; // sequence number had a really large discontinuity
+	int64 m_nPktsRecvDroppedAccumulator;
+	int64 m_nPktsRecvOutOfOrderAccumulator;
+	int64 m_nPktsRecvDuplicateAccumulator;
+	int64 m_nPktsRecvLurchAccumulator;
+	inline int64 PktsRecvDropped() const { return m_nPktsRecvDroppedAccumulator + m_seqPktCounters.m_nDropped; }
+	inline int64 PktsRecvOutOfOrder() const { return m_nPktsRecvOutOfOrderAccumulator + m_seqPktCounters.m_nOutOfOrder; }
+	inline int64 PktsRecvDuplicate() const { return m_nPktsRecvDuplicateAccumulator + m_seqPktCounters.m_nDuplicate; }
+	inline int64 PktsRecvLurch() const { return m_nPktsRecvLurchAccumulator + m_seqPktCounters.m_nLurch; }
 
 	/// Lifetime quality statistics
 	PercentileGenerator<uint8> m_qualitySample;
@@ -446,7 +649,7 @@ struct LinkStatsTrackerBase
 		return
 			!m_bPassive
 			&& m_nReplyTimeoutsSinceLastRecv > 0 // We're timing out
-			&& m_usecLastSendPacketExpectingImmediateReply+k_usecAggressivePingInterval < usecNow; // we haven't just recently sent an aggressive ping.
+			&& m_usecLastSendPacketExpectingImmediateReply+k_usecAggressivePingInterval <= usecNow; // we haven't just recently sent an aggressive ping.
 	}
 
 	/// Check if we should send a keepalive ping.  In this case we haven't heard from the peer in a while,
@@ -456,29 +659,13 @@ struct LinkStatsTrackerBase
 		return
 			!m_bPassive
 			&& m_usecInFlightReplyTimeout == 0 // not already tracking some other message for which we expect a reply (and which would confirm that the connection is alive)
-			&& m_usecTimeLastRecv + k_usecKeepAliveInterval < usecNow; // haven't heard from the peer recently
-	}
-
-	/// Check if we have data worth sending, if we have a good
-	/// opportunity (inline in a data packet) to do it.
-	inline bool BReadyToSendStats( SteamNetworkingMicroseconds usecNow )
-	{
-		bool bResult = false;
-		if ( m_pktNumInFlight == 0 && !m_bPassive )
-		{
-			if ( m_usecPeerAckedInstaneous + k_usecLinkStatsInstantaneousReportInterval < usecNow && BCheckHaveDataToSendInstantaneous( usecNow ) )
-				bResult = true ;
-			if ( m_usecPeerAckedLifetime + k_usecLinkStatsLifetimeReportInterval < usecNow && BCheckHaveDataToSendLifetime( usecNow ) )
-				bResult = true;
-		}
-
-		return bResult;
+			&& m_usecTimeLastRecv + k_usecKeepAliveInterval <= usecNow; // haven't heard from the peer recently
 	}
 
 	/// Fill out message with everything we'd like to send.  We don't assume that we will
 	/// actually send it.  (We might be looking for a good opportunity, and the data we want
 	/// to send doesn't fit.)
-	void PopulateMessage( CMsgSteamDatagramConnectionQuality &msg, SteamNetworkingMicroseconds usecNow );
+	void PopulateMessage( int nNeedFlags, CMsgSteamDatagramConnectionQuality &msg, SteamNetworkingMicroseconds usecNow );
 	void PopulateLifetimeMessage( CMsgSteamDatagramLinkLifetimeStats &msg );
 	/// Called when we send any message for which we expect some sort of reply.  (But maybe not an ack.)
 	void TrackSentMessageExpectingReply( SteamNetworkingMicroseconds usecNow, bool bAllowDelayedReply );
@@ -566,8 +753,8 @@ struct LinkStatsTrackerBase
 		m_bInFlightInstantaneous = m_bInFlightLifetime = false;
 	}
 
-	/// Check if we really need to flush out stats now.
-	bool BNeedToSendStats( SteamNetworkingMicroseconds usecNow );
+	/// Get urgency level to send instantaneous/lifetime stats.
+	int GetStatsSendNeed( SteamNetworkingMicroseconds usecNow );
 
 	/// Describe this stats tracker, for debugging, asserts, etc
 	virtual std::string Describe() const = 0;
@@ -628,19 +815,16 @@ protected:
 	/// Are we in "passive" state?  When we are "active", we expect that our peer is awake
 	/// and will reply to our messages, and that we should be actively sending our peer
 	/// connection quality statistics and keepalives.  When we are passive, we still measure
-	/// statistics and can receive messages from the peer, and send acknowledgements as necessary.
+	/// statistics and can receive messages from the peer, and send acknowledgments as necessary.
 	/// but we will indicate that keepalives or stats need to be sent to the peer.
 	bool m_bPassive;
 
-	/// Called to switch the pasive state.  (Should only be called on an actual state change.)
+	/// Called to switch the passive state.  (Should only be called on an actual state change.)
 	void SetPassiveInternal( bool bFlag, SteamNetworkingMicroseconds usecNow );
 
 	/// Check if we really need to flush out stats now.  Derived class should provide the reason strings.
 	/// (See the code.)
-	const char *NeedToSendStats( SteamNetworkingMicroseconds usecNow, const char *const arpszReasonStrings[4] );
-
-	/// Get time when we need to take action or think
-	SteamNetworkingMicroseconds GetNextThinkTimeInternal( SteamNetworkingMicroseconds usecNow ) const;
+	const char *InternalGetSendStatsReasonOrUpdateNextThinkTime( SteamNetworkingMicroseconds usecNow, const char *const arpszReasonStrings[4], SteamNetworkingMicroseconds &inOutNextThinkTime );
 
 	/// Called when we send a packet for which we expect a reply and
 	/// for which we expect to get latency info.
@@ -657,6 +841,57 @@ protected:
 	inline static void ReceivedPingInternal( TLinkStatsTracker *pThis, int nPingMS, SteamNetworkingMicroseconds usecNow )
 	{
 		pThis->m_ping.ReceivedPing( nPingMS, usecNow );
+	}
+
+	inline bool BInternalNeedToSendPingImmediate( SteamNetworkingMicroseconds usecNow, SteamNetworkingMicroseconds &inOutNextThinkTime )
+	{
+		if ( m_nReplyTimeoutsSinceLastRecv == 0 )
+			return false;
+		SteamNetworkingMicroseconds usecUrgentPing = m_usecLastSendPacketExpectingImmediateReply+k_usecAggressivePingInterval;
+		if ( usecUrgentPing <= usecNow )
+			return true;
+		if ( usecUrgentPing < inOutNextThinkTime )
+			inOutNextThinkTime = usecUrgentPing;
+		return false;
+	}
+
+	inline bool BInternalNeedToSendKeepAlive( SteamNetworkingMicroseconds usecNow, SteamNetworkingMicroseconds &inOutNextThinkTime )
+	{
+		if ( m_usecInFlightReplyTimeout == 0 )
+		{
+			SteamNetworkingMicroseconds usecKeepAlive = m_usecTimeLastRecv + k_usecKeepAliveInterval;
+			if ( usecKeepAlive <= usecNow )
+				return true;
+			if ( usecKeepAlive < inOutNextThinkTime )
+				inOutNextThinkTime = usecKeepAlive;
+		}
+		else
+		{
+			if ( m_usecInFlightReplyTimeout < inOutNextThinkTime )
+				inOutNextThinkTime = m_usecInFlightReplyTimeout;
+		}
+		return false;
+	}
+
+	// Hooks that derived classes may override when we process a packet
+	// and it meets certain characteristics
+	inline void InternalProcessSequencedPacket_Count()
+	{
+		m_seqPktCounters.OnRecv();
+		++m_nPktsRecvSequenced;
+	}
+	void InternalProcessSequencedPacket_OutOfOrder( int64 nPktNum );
+	inline void InternalProcessSequencedPacket_Duplicate()
+	{
+		m_seqPktCounters.OnDuplicate();
+	}
+	inline void InternalProcessSequencedPacket_Lurch()
+	{
+		m_seqPktCounters.OnLurch();
+	}
+	inline void InternalProcessSequencedPacket_Dropped( int nDropped )
+	{
+		m_seqPktCounters.OnDropped( nDropped );
 	}
 
 private:
@@ -681,9 +916,6 @@ private:
 	void UpdateInterval( SteamNetworkingMicroseconds usecNow );
 
 	void StartNextInterval( SteamNetworkingMicroseconds usecNow );
-
-	/// Do internal stats handling and checking on packet number
-	bool BCheckPacketNumberOldOrDuplicate( int64 nPktNum );
 };
 
 struct LinkStatsTrackerEndToEnd : public LinkStatsTrackerBase
@@ -702,6 +934,12 @@ struct LinkStatsTrackerEndToEnd : public LinkStatsTrackerBase
 		// our RTT is very low
 		return m_ping.m_nSmoothedPing*3000 + ( k_usecMaxDataAckDelay + 10000 );
 	}
+
+	/// Time when the connection entered the connection state
+	SteamNetworkingMicroseconds m_usecWhenStartedConnectedState;
+
+	/// Time when the connection ended
+	SteamNetworkingMicroseconds m_usecWhenEndedConnectedState;
 
 	/// Time when the current interval started
 	SteamNetworkingMicroseconds m_usecSpeedIntervalStart;
@@ -735,20 +973,32 @@ struct LinkStatsTrackerEndToEnd : public LinkStatsTrackerBase
 	/// Called when we get a speed sample
 	void UpdateSpeeds( int nTXSpeed, int nRXSpeed );
 
-	/// Do we need to send anything?  Return the reason code, or NULL if
-	/// we don't need to send anything right now
-	inline const char *NeedToSend( SteamNetworkingMicroseconds usecNow )
+	/// Do we need to send any stats?
+	inline const char *GetSendReasonOrUpdateNextThinkTime( SteamNetworkingMicroseconds usecNow, EStatsReplyRequest &eReplyRequested, SteamNetworkingMicroseconds &inOutNextThinkTime )
 	{
+		if ( m_bPassive )
+		{
+			if ( m_usecInFlightReplyTimeout > 0 && m_usecInFlightReplyTimeout < inOutNextThinkTime )
+				inOutNextThinkTime = m_usecInFlightReplyTimeout;
+			eReplyRequested = k_EStatsReplyRequest_NothingToSend;
+			return nullptr;
+		}
 
-		// Connectivity check because we appear to be timing out?
-		if ( BNeedToSendPingImmediate( usecNow ) )
+		// Urgent ping?
+		if ( BInternalNeedToSendPingImmediate( usecNow, inOutNextThinkTime ) )
+		{
+			eReplyRequested = k_EStatsReplyRequest_Immediate;
 			return "E2EUrgentPing";
+		}
 
-		// Ordinary keepalive?
-		if ( BNeedToSendKeepalive( usecNow ) )
-			return "E2EKeepalive";
+		// Keepalive?
+		if ( BInternalNeedToSendKeepAlive( usecNow, inOutNextThinkTime ) )
+		{
+			eReplyRequested = k_EStatsReplyRequest_DelayedOK;
+			return "E2EKeepAlive";
+		}
 
-		// Stats?
+		// Connection stats?
 		static const char *arpszReasons[4] =
 		{
 			nullptr,
@@ -756,7 +1006,15 @@ struct LinkStatsTrackerEndToEnd : public LinkStatsTrackerBase
 			"E2ELifetimeStats",
 			"E2EAllStats"
 		};
-		return LinkStatsTrackerBase::NeedToSendStats( usecNow, arpszReasons );
+		const char *pszReason = LinkStatsTrackerBase::InternalGetSendStatsReasonOrUpdateNextThinkTime( usecNow, arpszReasons, inOutNextThinkTime );
+		if ( pszReason )
+		{
+			eReplyRequested = k_EStatsReplyRequest_DelayedOK;
+			return pszReason;
+		}
+
+		eReplyRequested = k_EStatsReplyRequest_NothingToSend;
+		return nullptr;
 	}
 
 	/// Describe this stats tracker, for debugging, asserts, etc
@@ -774,21 +1032,6 @@ protected:
 		{
 			pThis->UpdateSpeedInterval( usecNow );
 		}
-	}
-
-	inline SteamNetworkingMicroseconds GetNextThinkTimeInternal( SteamNetworkingMicroseconds usecNow ) const
-	{
-		SteamNetworkingMicroseconds usecResult = LinkStatsTrackerBase::GetNextThinkTimeInternal( usecNow );
-		if ( !m_bPassive )
-		{
-			if ( !m_usecInFlightReplyTimeout )
-			{
-				// Time when BNeedToSendKeepalive will return true
-				usecResult = std::min( usecResult, m_usecTimeLastRecv + k_usecKeepAliveInterval );
-			}
-		}
-
-		return usecResult;
 	}
 
 private:
@@ -815,7 +1058,6 @@ struct LinkStatsTracker final : public TLinkStatsTracker
 	inline bool IsPassive() const { return TLinkStatsTracker::m_bPassive; }
 	inline void TrackSentMessageExpectingSeqNumAck( SteamNetworkingMicroseconds usecNow, bool bAllowDelayedReply ) { TLinkStatsTracker::TrackSentMessageExpectingSeqNumAckInternal( this, usecNow, bAllowDelayedReply ); }
 	inline void TrackSentPingRequest( SteamNetworkingMicroseconds usecNow, bool bAllowDelayedReply ) { TLinkStatsTracker::TrackSentPingRequestInternal( this, usecNow, bAllowDelayedReply ); }
-	inline SteamNetworkingMicroseconds GetNextThinkTime( SteamNetworkingMicroseconds usecNow ) const { return TLinkStatsTracker::GetNextThinkTimeInternal( usecNow ); }
 	inline void ReceivedPing( int nPingMS, SteamNetworkingMicroseconds usecNow ) { TLinkStatsTracker::ReceivedPingInternal( this, nPingMS, usecNow ); }
 	inline void InFlightReplyTimeout( SteamNetworkingMicroseconds usecNow ) { TLinkStatsTracker::InFlightReplyTimeoutInternal( this, usecNow ); }
 
@@ -860,6 +1102,163 @@ struct LinkStatsTracker final : public TLinkStatsTracker
 		return bResult;
 	}
 
+	// Shortcut when we know that we aren't going to send now, but we want to know when to wakeup and do so
+	inline SteamNetworkingMicroseconds GetNextThinkTime( SteamNetworkingMicroseconds usecNow )
+	{
+		SteamNetworkingMicroseconds usecNextThink = k_nThinkTime_Never;
+		EStatsReplyRequest eReplyRequested;
+		if ( TLinkStatsTracker::GetSendReasonOrUpdateNextThinkTime( usecNow, eReplyRequested, usecNextThink ) )
+			return k_nThinkTime_ASAP;
+		return usecNextThink;
+	}
+
+	/// Called when we receive a packet with a sequence number.
+	/// This expands the wire packet number to its full value,
+	/// and checks if it is a duplicate or out of range.
+	/// Stats are also updated
+	int64 ExpandWirePacketNumberAndCheck( uint16 nWireSeqNum )
+	{
+		int16 nGap = (int16)( nWireSeqNum - (uint16)TLinkStatsTracker::m_nMaxRecvPktNum );
+		int64 nPktNum = TLinkStatsTracker::m_nMaxRecvPktNum + nGap;
+
+		// We've received a packet with a sequence number.
+		// Update stats
+		TLinkStatsTracker::m_arDebugHistoryRecvSeqNum[ TLinkStatsTracker::m_nPktsRecvSequenced & 255 ] = nPktNum;
+		TLinkStatsTracker::InternalProcessSequencedPacket_Count();
+
+		// Packet number is increasing?
+		// (Maybe by a lot -- we don't handle that here.)
+		if ( likely( nPktNum > TLinkStatsTracker::m_nMaxRecvPktNum ) )
+			return nPktNum;
+
+		// Which block of 64-bit packets is it in?
+		int64 B = TLinkStatsTracker::m_nMaxRecvPktNum & ~int64{63};
+		int64 idxRecvBitmask = ( ( nPktNum - B ) >> 6 ) + 1;
+		Assert( idxRecvBitmask < 2 );
+		if ( idxRecvBitmask < 0 )
+		{
+			// Too old (at least 64 packets old, maybe up to 128).
+			TLinkStatsTracker::InternalProcessSequencedPacket_Lurch(); // Should we track "very old" under a different stat than "lurch"?
+			return 0;
+		}
+		uint64 bit = uint64{1} << ( nPktNum & 63 );
+		if ( TLinkStatsTracker::m_recvPktNumberMask[ idxRecvBitmask ] & bit )
+		{
+			// Duplicate
+			TLinkStatsTracker::InternalProcessSequencedPacket_Duplicate();
+			return 0;
+		}
+
+		// We have an out of order packet.  We'll update that
+		// stat in TrackProcessSequencedPacket
+		Assert( nPktNum > 0 && nPktNum < TLinkStatsTracker::m_nMaxRecvPktNum );
+		return nPktNum;
+	}
+
+	/// Same as ExpandWirePacketNumberAndCheck, but if this is the first sequenced
+	/// packet we have ever received, initialize the packet number
+	int64 ExpandWirePacketNumberAndCheckMaybeInitialize( uint16 nWireSeqNum )
+	{
+		if ( unlikely( TLinkStatsTracker::m_nMaxRecvPktNum == 0 ) )
+			TLinkStatsTracker::ResetMaxRecvPktNumForIncomingWirePktNum( nWireSeqNum );
+		return ExpandWirePacketNumberAndCheck( nWireSeqNum );
+	}
+
+	/// Called when we have processed a packet with a sequence number, to update estimated
+	/// number of dropped packets, etc.  This MUST only be called after we have
+	/// called ExpandWirePacketNumberAndCheck, to ensure that the packet number is not a
+	/// duplicate or out of range.
+	inline void TrackProcessSequencedPacket( int64 nPktNum, SteamNetworkingMicroseconds usecNow, int usecSenderTimeSincePrev )
+	{
+		Assert( nPktNum > 0 );
+
+		// Update bitfield of received packets
+		int64 B = TLinkStatsTracker::m_nMaxRecvPktNum & ~int64{63};
+		int64 idxRecvBitmask = ( ( nPktNum - B ) >> 6 ) + 1;
+		Assert( idxRecvBitmask >= 0 ); // We should have discarded very old packets already
+		if ( idxRecvBitmask >= 2 ) // Most common case is 0 or 1
+		{
+			if ( idxRecvBitmask == 2 )
+			{
+				// Crossed to the next 64-packet block.  Shift bitmasks forward by one.
+				TLinkStatsTracker::m_recvPktNumberMask[0] = TLinkStatsTracker::m_recvPktNumberMask[1];
+			}
+			else
+			{
+				// Large packet number jump, we skipped a whole block
+				TLinkStatsTracker::m_recvPktNumberMask[0] = 0;
+			}
+			TLinkStatsTracker::m_recvPktNumberMask[1] = 0;
+			idxRecvBitmask = 1;
+		}
+		uint64 bit = uint64{1} << ( nPktNum & 63 );
+		Assert( !( TLinkStatsTracker::m_recvPktNumberMask[ idxRecvBitmask ] & bit ) ); // Should not have already been marked!  We should have already discarded duplicates
+		TLinkStatsTracker::m_recvPktNumberMask[ idxRecvBitmask ] |= bit;
+
+		// Check for dropped packet.  Since we hope that by far the most common
+		// case will be packets delivered in order, we optimize this logic
+		// for that case.
+		int64 nGap = nPktNum - TLinkStatsTracker::m_nMaxRecvPktNum;
+		if ( likely( nGap == 1 ) )
+		{
+			++TLinkStatsTracker::m_nDebugPktsRecvInOrder;
+
+			// We've received two packets, in order.  Did the sender supply the time between packets on his side?
+			if ( usecSenderTimeSincePrev > 0 )
+			{
+				int usecJitter = ( usecNow - TLinkStatsTracker::m_usecTimeLastRecvSeq ) - usecSenderTimeSincePrev;
+				usecJitter = abs( usecJitter );
+				if ( usecJitter < k_usecTimeSinceLastPacketMaxReasonable )
+				{
+
+					// Update max jitter for current interval
+					TLinkStatsTracker::m_seqPktCounters.m_usecMaxJitter = std::max( TLinkStatsTracker::m_seqPktCounters.m_usecMaxJitter, usecJitter );
+					TLinkStatsTracker::m_jitterHistogram.AddSample( usecJitter );
+				}
+				else
+				{
+					// Something is really, really off.  Discard measurement
+				}
+			}
+
+		}
+		else if ( unlikely( nGap <= 0 ) )
+		{
+			// Packet number moving backward
+			// We should have already rejected duplicates
+			Assert( nGap != 0 );
+
+			// Packet number moving in reverse.
+			// It should be a *small* negative step, e.g. packets delivered out of order.
+			// If the packet is really old, we should have already discarded it earlier.
+			Assert( nGap >= -8 * (int64)sizeof(TLinkStatsTracker::m_recvPktNumberMask) );
+
+			// out of order
+			TLinkStatsTracker::InternalProcessSequencedPacket_OutOfOrder( nPktNum );
+			return;
+		}
+		else 
+		{
+			// Packet number moving forward, i.e. a dropped packet
+			// Large gap?
+			if ( unlikely( nGap >= 100 ) )
+			{
+				// Very weird.
+				TLinkStatsTracker::InternalProcessSequencedPacket_Lurch();
+
+				// Reset the sequence number for packets going forward.
+				TLinkStatsTracker::InitMaxRecvPktNum( nPktNum );
+				return;
+			}
+
+			// Probably the most common case (after a perfect packet stream), we just dropped a packet or two
+			TLinkStatsTracker::InternalProcessSequencedPacket_Dropped( nGap-1 );
+		}
+
+		// Save highest known sequence number for next time.
+		TLinkStatsTracker::m_nMaxRecvPktNum = nPktNum;
+		TLinkStatsTracker::m_usecTimeLastRecvSeq = usecNow;
+	}
 };
 
 

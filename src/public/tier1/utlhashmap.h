@@ -7,14 +7,10 @@
 
 #ifndef UTLHASHMAP_H
 #define UTLHASHMAP_H
-
-#ifdef _WIN32
 #pragma once
-#endif
 
-#include "tier0/dbg.h"
-#include "tier1/bitstring.h"
-#include "tier1/utlvector.h"
+#include <tier0/dbg.h>
+#include "utlvector.h"
 
 #define FOR_EACH_HASHMAP( mapName, iteratorName ) \
 	for ( int iteratorName = 0; iteratorName < (mapName).MaxElement(); ++iteratorName ) if ( !(mapName).IsValidIndex( iteratorName ) ) continue; else
@@ -36,20 +32,28 @@
 template <typename K, typename T, typename L, typename H > 
 class CUtlHashMap
 {
+protected:
+	enum ReplaceExisting
+	{
+		False = 0,
+		True = 1,
+	};
+
 public:
-	typedef K KeyType_t;
-	typedef T ElemType_t;
-	typedef int IndexType_t;
-	typedef L EqualityFunc_t;
-	typedef H HashFunc_t;
+	using KeyType_t= K;
+	using ElemType_t = T;
+	using IndexType_t = int;
+	using EqualityFunc_t = L;
+	using HashFunc_t = H;
 	static constexpr IndexType_t kInvalidIndex = -1;
 
 	CUtlHashMap()
 	{
 		m_cElements = 0;
 		m_nMaxElement = 0;
-		m_nMinRehashedBucket = kInvalidIndex;
-		m_nMaxRehashedBucket = kInvalidIndex;
+		m_nNeedRehashStart = 0;
+		m_nNeedRehashEnd = 0;
+		m_nMinBucketMask = 1;
 		m_iNodeFreeListHead = kInvalidIndex;
 	}
 
@@ -57,8 +61,9 @@ public:
 	{
 		m_cElements = 0;
 		m_nMaxElement = 0;
-		m_nMinRehashedBucket = kInvalidIndex;
-		m_nMaxRehashedBucket = kInvalidIndex;
+		m_nNeedRehashStart = 0;
+		m_nNeedRehashEnd = 0;
+		m_nMinBucketMask = 1;
 		m_iNodeFreeListHead = kInvalidIndex;
 		EnsureCapacity( cElementsExpected );
 	}
@@ -101,25 +106,49 @@ public:
 	static constexpr IndexType_t InvalidIndex()						{ return -1; }
 
 	// Insert method
-	IndexType_t  Insert( const KeyType_t &key )								{ return InsertOrReplace( key ); }
-	IndexType_t  Insert( const KeyType_t &key, const ElemType_t &insert )	{ return InsertOrReplace( key, insert ); }
-	IndexType_t  InsertOrReplace( const KeyType_t &key );
-	IndexType_t  InsertOrReplace( const KeyType_t &key, const ElemType_t &insert );
-	IndexType_t  InsertWithDupes( const KeyType_t &key, const ElemType_t &insert );
+	IndexType_t  Insert( const KeyType_t &key )								{ return FindOrInsert_Internal( key, ReplaceExisting::True ); }
+	IndexType_t  Insert( KeyType_t &&key )									{ return FindOrInsert_Internal( std::move(key), ReplaceExisting::True ); }
+	
+	// Insert or replace the existing if found (no dupes)
+	IndexType_t  Insert( const KeyType_t &key, const ElemType_t &insert )	{ return FindOrInsert_Internal( key, insert, ReplaceExisting::True ); }
+	IndexType_t  Insert( const KeyType_t &key, ElemType_t &&insert )		{ return FindOrInsert_Internal( key, std::move(insert), ReplaceExisting::True ); }
+	IndexType_t  Insert( KeyType_t &&key, const ElemType_t &insert )		{ return FindOrInsert_Internal( std::move(key), insert, ReplaceExisting::True ); }
+	IndexType_t  Insert( KeyType_t &&key, ElemType_t &&insert )				{ return FindOrInsert_Internal( std::move(key), std::move(insert), ReplaceExisting::True ); }
+
+	// Insert or replace the existing if found (no dupes)
+	IndexType_t  InsertOrReplace( const KeyType_t &key, const ElemType_t &insert )	{ return FindOrInsert_Internal( key, insert, ReplaceExisting::True ); }
+	IndexType_t  InsertOrReplace( const KeyType_t &key, ElemType_t &&insert )		{ return FindOrInsert_Internal( key, std::move(insert), ReplaceExisting::True ); }
+	IndexType_t  InsertOrReplace( KeyType_t &&key, const ElemType_t &insert )		{ return FindOrInsert_Internal( std::move(key), insert, ReplaceExisting::True ); }
+	IndexType_t  InsertOrReplace( KeyType_t &&key, ElemType_t &&insert )			{ return FindOrInsert_Internal( std::move(key), std::move(insert), ReplaceExisting::True ); }
+
+	// Insert ALWAYS, possibly creating a dupe
+	IndexType_t  InsertWithDupes( const KeyType_t &key, const ElemType_t &insert )	{ return InsertWithDupes_Internal( key, insert ); }
+	IndexType_t  InsertWithDupes( const KeyType_t &key, ElemType_t &&insert )		{ return InsertWithDupes_Internal( key, std::move(insert) ); }
+	IndexType_t  InsertWithDupes( KeyType_t &&key, const ElemType_t &insert )		{ return InsertWithDupes_Internal( std::move(key), insert ); }
+	IndexType_t  InsertWithDupes( KeyType_t &&key, ElemType_t &&insert )			{ return InsertWithDupes_Internal( std::move(key), std::move(insert) ); }
 
 	// Find-or-insert method, one-arg - can insert default-constructed element
 	// when there is no available copy constructor or assignment operator
-	IndexType_t  FindOrInsert( const KeyType_t &key );
+	IndexType_t  FindOrInsert( const KeyType_t &key )						{ return FindOrInsert_Internal( key, ReplaceExisting::False ); }
+	IndexType_t  FindOrInsert( KeyType_t &&key )							{ return FindOrInsert_Internal( std::move(key), ReplaceExisting::False ); }
 
 	// Find-or-insert method, two-arg - can insert an element when there is no
 	// copy constructor for the type (but does require assignment operator)
-	IndexType_t  FindOrInsert( const KeyType_t &key, const ElemType_t &insert );
+	IndexType_t  FindOrInsert( const KeyType_t &key, const ElemType_t &insert )	{ return FindOrInsert_Internal( key, insert, ReplaceExisting::False ); }
+	IndexType_t  FindOrInsert( const KeyType_t &key, ElemType_t &&insert )		{ return FindOrInsert_Internal( key, std::move(insert), ReplaceExisting::False ); }
+	IndexType_t  FindOrInsert( KeyType_t &&key, const ElemType_t &insert )		{ return FindOrInsert_Internal( std::move(key), insert, ReplaceExisting::False ); }
+	IndexType_t  FindOrInsert( KeyType_t &&key, ElemType_t &&insert )			{ return FindOrInsert_Internal( std::move(key), std::move(insert), ReplaceExisting::False ); }
 
 	// Find key, insert with default value if not found.  Returns pointer to the
 	// element
 	ElemType_t *FindOrInsertGetPtr( const KeyType_t &key )
 	{
 		IndexType_t i = FindOrInsert(key);
+		return &m_memNodes.Element( i ).m_elem;
+	}
+	ElemType_t *FindOrInsertGetPtr( KeyType_t &&key )
+	{
+		IndexType_t i = FindOrInsert( std::move( key ) );
 		return &m_memNodes.Element( i ).m_elem;
 	}
 
@@ -188,7 +217,17 @@ public:
 	void Swap( CUtlHashMap< K, T, L, H > &that );
 
 protected:
-	IndexType_t InsertUnconstructed( const KeyType_t &key, IndexType_t *pExistingIndex, bool bAllowDupes );
+	template < typename pf_key >
+	IndexType_t  FindOrInsert_Internal( pf_key &&key, ReplaceExisting bReplace );
+
+	template < typename pf_key, typename pf_elem >
+	IndexType_t  FindOrInsert_Internal( pf_key &&key, pf_elem &&insert, ReplaceExisting bReplace );
+
+	template < typename pf_key, typename pf_elem >
+	IndexType_t  InsertWithDupes_Internal( pf_key &&key, pf_elem &&insert );
+
+	template < typename KeyType_universal_ref >
+	IndexType_t InsertUnconstructed( KeyType_universal_ref &&key, IndexType_t *pExistingIndex, bool bAllowDupes );
 
 	inline IndexType_t FreeNodeIDToIndex( IndexType_t i ) const	{ return (0-i)-3; }
 	inline IndexType_t FreeNodeIndexToID( IndexType_t i ) const	{ return (-3)-i; }
@@ -197,7 +236,6 @@ protected:
 	int AllocNode();
 	void RehashNodesInBucket( int iBucket );
 	void LinkNodeIntoBucket( int iBucket, int iNewNode );
-	void UnlinkNodeFromBucket( int iBucket, int iNewNode );
 	bool RemoveNodeFromBucket( int iBucket, int iNodeToRemove );
 	void IncrementalRehash();
 
@@ -206,8 +244,6 @@ protected:
 		IndexType_t m_iNode;
 	};
 	CUtlVector<HashBucket_t> m_vecHashBuckets;
-
-	CBitString m_bitsMigratedBuckets;
 
 	struct Node_t
 	{
@@ -221,7 +257,8 @@ protected:
 
 	IndexType_t m_cElements;
 	IndexType_t m_nMaxElement;
-	IndexType_t m_nMinRehashedBucket, m_nMaxRehashedBucket;
+	IndexType_t m_nNeedRehashStart, m_nNeedRehashEnd; // Range of buckets that need to be rehashed
+	IndexType_t m_nMinBucketMask; // Mask at the time we last finished completed rehashing.  So no need to check hash buckets based on mask smaller than this.
 	EqualityFunc_t m_EqualityFunc;
 	HashFunc_t m_HashFunc;
 
@@ -270,7 +307,7 @@ public:
 		inline ItemRef( const CUtlHashMap< K, T, L, H > &map, int idx ) : m_node( const_cast< Node_t &>( map.m_memNodes[idx] ) ), m_idx(idx) {}
 		ItemRef( const ItemRef &x ) = default;
 		inline int Index() const { return m_idx; }
-		inline const KeyType_t &Key() { return m_node.m_key; }
+		inline const KeyType_t &Key() const { return m_node.m_key; }
 		inline const ElemType_t &Element() const { return m_node.m_elem; }
 	};
 	struct MutableItemRef : ItemRef
@@ -384,11 +421,13 @@ public:
 
 
 //-----------------------------------------------------------------------------
-// Purpose: inserts a key into the map with an unconstructed element member
-// (to be copy constructed or default-constructed by a wrapper function)
+// Purpose: inserts and constructs a key into the map.
+// Element member is left unconstructed (to be copy constructed or default-constructed by a wrapper function)
+// Supports both copy and move constructors for KeyType_t via universal refs and type deduction
 //-----------------------------------------------------------------------------
 template <typename K, typename T, typename L, typename H> 
-inline int CUtlHashMap<K,T,L,H>::InsertUnconstructed( const KeyType_t &key, int *piNodeExistingIfDupe, bool bAllowDupes )
+template <typename KeyType_universal_ref>
+inline int CUtlHashMap<K,T,L,H>::InsertUnconstructed( KeyType_universal_ref &&key, int *piNodeExistingIfDupe, bool bAllowDupes )
 {
 	// make sure we have room in the hash table
 	if ( m_cElements >= m_vecHashBuckets.Count() )
@@ -396,36 +435,44 @@ inline int CUtlHashMap<K,T,L,H>::InsertUnconstructed( const KeyType_t &key, int 
 	if ( m_cElements >= m_memNodes.Count() )
 		m_memNodes.Grow( m_memNodes.Count() * 2 );
 
-	// rehash incrementally
-	IncrementalRehash();
+	// Do a bit of cleanup, if table is not already clean.  If statement here
+	// avoids the function call in the (hopefully common!) case that the table
+	// is already clean
+	if ( m_nNeedRehashStart < m_nNeedRehashEnd )
+		IncrementalRehash();
 
 	// hash the item
-	auto hash = m_HashFunc( key );
+	int hash = (int)m_HashFunc( key );
 
-	// migrate data forward, if necessary
-	int cBucketsToModAgainst = m_vecHashBuckets.Count() >> 1;
-	int iBucket = basetypes::ModPowerOf2(hash, cBucketsToModAgainst);
-	DbgAssert( m_nMinRehashedBucket > 0 ); // The IncrementalRehash() above prevents this case
-	while ( iBucket >= m_nMinRehashedBucket
-		&& !m_bitsMigratedBuckets.GetBit( iBucket ) )
+	// Make sure any buckets that might contain duplicates have been rehashed, so that we only need
+	// to check one bucket below.  Also, we have the invariant that all duplicates (if they are allowed)
+	// are in the same bucket.  This rehashing might not actually be necessary, because we might have
+	// already done it.  But it's probably not worth keeping track of.  1.) The number of back probes
+	// in normal usage is at most 1.  2.) If hashing is reasonably effective, then the number of items
+	// in each bucket should be small.
+	int nBucketMaskMigrate = ( m_vecHashBuckets.Count() >> 1 ) - 1;
+	while ( nBucketMaskMigrate >= m_nMinBucketMask )
 	{
-		RehashNodesInBucket( iBucket );
-		cBucketsToModAgainst >>= 1;
-		iBucket = basetypes::ModPowerOf2(hash, cBucketsToModAgainst);
+		int iBucketMigrate = hash & nBucketMaskMigrate;
+		if ( iBucketMigrate < m_nNeedRehashStart )
+			break;
+		RehashNodesInBucket( iBucketMigrate );
+		nBucketMaskMigrate >>= 1;
 	}
 
+	int iBucket = hash & ( m_vecHashBuckets.Count()-1 );
+
 	// return existing node without insert, if duplicates are not permitted
-	if ( !bAllowDupes && m_cElements )
+	if ( !bAllowDupes )
 	{
 		// look in the bucket to see if we have a conflict
-		int iBucket2 = basetypes::ModPowerOf2( hash, m_vecHashBuckets.Count() );
-		IndexType_t iNode = FindInBucket( iBucket2, key );
-		if ( piNodeExistingIfDupe )
-		{
-			*piNodeExistingIfDupe = iNode;
-		}
+		IndexType_t iNode = FindInBucket( iBucket, key );
 		if ( iNode != kInvalidIndex )
 		{
+			if ( piNodeExistingIfDupe )
+			{
+				*piNodeExistingIfDupe = iNode;
+			}
 			return kInvalidIndex;
 		}
 	}
@@ -433,10 +480,9 @@ inline int CUtlHashMap<K,T,L,H>::InsertUnconstructed( const KeyType_t &key, int 
 	// make an item
 	int iNewNode = AllocNode();
 	m_memNodes[iNewNode].m_iNextNode = kInvalidIndex;
-	CopyConstruct( &m_memNodes[iNewNode].m_key, key );
+	Construct( &m_memNodes[iNewNode].m_key, std::forward<KeyType_universal_ref>( key ) );
 	// Note: m_elem remains intentionally unconstructed here
-
-	iBucket = basetypes::ModPowerOf2( hash, m_vecHashBuckets.Count() );
+	// Note: key may have been moved depending on which constructor was called.
 
 	// link ourselves in
 	//	::OutputDebugStr( CFmtStr( "insert %d into bucket %d\n", key, iBucket ).Access() );
@@ -457,11 +503,18 @@ inline int CUtlHashMap<K,T,L,H>::InsertUnconstructed( const KeyType_t &key, int 
 // Purpose: inserts a default item into the map, no change if key already exists
 //-----------------------------------------------------------------------------
 template <typename K, typename T, typename L, typename H> 
-inline int CUtlHashMap<K,T,L,H>::FindOrInsert( const KeyType_t &key )
+template < typename pf_key >
+inline int CUtlHashMap<K,T,L,H>::FindOrInsert_Internal( pf_key &&key, ReplaceExisting bReplace )
 {
 	int iNodeExisting;
-	int iNodeInserted = InsertUnconstructed( key, &iNodeExisting, false /*no duplicates allowed*/ ); // copies key
-	if ( iNodeInserted != kInvalidIndex )
+	int iNodeInserted = InsertUnconstructed( std::forward<pf_key>( key ), &iNodeExisting, false /*no duplicates allowed*/ );
+	// If replacing, stomp the existing one
+	if ( bReplace && iNodeExisting != kInvalidIndex )
+	{
+		Destruct( &m_memNodes[ iNodeExisting ].m_elem );
+		ValueInitializeConstruct( &m_memNodes[ iNodeExisting ].m_elem );
+	}
+	else if ( iNodeInserted != kInvalidIndex )
 	{
 		ValueInitializeConstruct( &m_memNodes[ iNodeInserted ].m_elem );
 		return iNodeInserted;
@@ -474,50 +527,22 @@ inline int CUtlHashMap<K,T,L,H>::FindOrInsert( const KeyType_t &key )
 // Purpose: inserts an item into the map, no change if key already exists
 //-----------------------------------------------------------------------------
 template <typename K, typename T, typename L, typename H> 
-inline int CUtlHashMap<K,T,L,H>::FindOrInsert( const KeyType_t &key, const ElemType_t &insert )
+template < typename pf_key, typename pf_elem >
+inline int CUtlHashMap<K,T,L,H>::FindOrInsert_Internal( pf_key &&key, pf_elem &&elem, ReplaceExisting bReplace )
 {
 	int iNodeExisting;
-	int iNodeInserted = InsertUnconstructed( key, &iNodeExisting, false /*no duplicates allowed*/ ); // copies key
-	if ( iNodeInserted != kInvalidIndex )
+	int iNodeInserted = InsertUnconstructed( std::forward<pf_key>( key ), &iNodeExisting, false /*no duplicates allowed*/ );
+	// If replacing, stomp the existing one
+	if ( bReplace && iNodeExisting != kInvalidIndex )
 	{
-		CopyConstruct( &m_memNodes[ iNodeInserted ].m_elem, insert );
+		Destruct( &m_memNodes[ iNodeExisting ].m_elem );
+		Construct( &m_memNodes[ iNodeExisting ].m_elem, std::forward<pf_elem>( elem ) );
+	}
+	else if ( iNodeInserted != kInvalidIndex )
+	{
+		Construct( &m_memNodes[ iNodeInserted ].m_elem, std::forward<pf_elem>( elem ) );
 		return iNodeInserted;
 	}
-	return iNodeExisting;
-}
-
-
-//-----------------------------------------------------------------------------
-// Purpose: inserts an item into the map, replaces existing item with same key
-//-----------------------------------------------------------------------------
-template <typename K, typename T, typename L, typename H> 
-inline int CUtlHashMap<K,T,L,H>::InsertOrReplace( const KeyType_t &key )
-{
-	int iNodeExisting;
-	int iNodeInserted = InsertUnconstructed( key, &iNodeExisting, false /*no duplicates allowed*/ ); // copies key
-	if ( iNodeInserted != kInvalidIndex )
-	{
-		ValueInitializeConstruct( &m_memNodes[ iNodeInserted ].m_elem );
-		return iNodeInserted;
-	}
-	return iNodeExisting;
-}
-
-
-//-----------------------------------------------------------------------------
-// Purpose: inserts an item into the map, replaces existing item with same key
-//-----------------------------------------------------------------------------
-template <typename K, typename T, typename L, typename H> 
-inline int CUtlHashMap<K,T,L,H>::InsertOrReplace( const KeyType_t &key, const ElemType_t &insert )
-{
-	int iNodeExisting;
-	int iNodeInserted = InsertUnconstructed( key, &iNodeExisting, false /*no duplicates allowed*/ ); // copies key
-	if ( iNodeInserted != kInvalidIndex )
-	{
-		CopyConstruct( &m_memNodes[ iNodeInserted ].m_elem, insert );
-		return iNodeInserted;
-	}
-	m_memNodes[ iNodeExisting ].m_elem = insert;
 	return iNodeExisting;
 }
 
@@ -525,12 +550,13 @@ inline int CUtlHashMap<K,T,L,H>::InsertOrReplace( const KeyType_t &key, const El
 // Purpose: inserts element no matter what, even if key already exists
 //-----------------------------------------------------------------------------
 template <typename K, typename T, typename L, typename H> 
-inline int CUtlHashMap<K,T,L,H>::InsertWithDupes( const KeyType_t &key, const ElemType_t &insert )
+template < typename pf_key, typename pf_elem >
+inline int CUtlHashMap<K,T,L,H>::InsertWithDupes_Internal( pf_key &&key, pf_elem &&insert )
 {
-	int iNodeInserted = InsertUnconstructed( key, NULL, true /*duplicates allowed!*/ ); // copies key
+	int iNodeInserted = InsertUnconstructed( std::forward<pf_key>( key ), NULL, true /*duplicates allowed!*/ ); // copies key
 	if ( iNodeInserted != kInvalidIndex )
 	{
-		CopyConstruct( &m_memNodes[ iNodeInserted ].m_elem, insert );
+		Construct( &m_memNodes[ iNodeInserted ].m_elem, std::forward<pf_elem>( insert ) );
 	}
 	return iNodeInserted;
 }
@@ -549,7 +575,8 @@ inline void CUtlHashMap<K,T,L,H>::EnsureCapacity( int amount )
 		return;
 	int cBucketsNeeded = MAX( 16, m_vecHashBuckets.Count() );
 	while ( cBucketsNeeded < amount )
-		cBucketsNeeded *= 2;
+		cBucketsNeeded <<= 1;
+	DbgAssert( ( cBucketsNeeded & (cBucketsNeeded-1) ) == 0 ); // It's a power of 2
 
 	// ::OutputDebugStr( CFmtStr( "grown m_vecHashBuckets from %d to %d\n", m_vecHashBuckets.Count(), cBucketsNeeded ).Access() );
 
@@ -558,22 +585,21 @@ inline void CUtlHashMap<K,T,L,H>::EnsureCapacity( int amount )
 	int iFirst = m_vecHashBuckets.AddMultipleToTail( grow );
 	// clear all the new data to invalid bits
 	memset( &m_vecHashBuckets[iFirst], 0xFFFFFFFF, grow*sizeof(m_vecHashBuckets[iFirst]) );
-	DbgAssert( basetypes::IsPowerOf2( m_vecHashBuckets.Count() ) );
+	DbgAssert( m_vecHashBuckets.Count() == cBucketsNeeded );
 
-	// we'll have to rehash, all the buckets that existed before growth
-	m_nMinRehashedBucket = 0;
-	m_nMaxRehashedBucket = iFirst;
+	// Mark appropriate range for rehashing
 	if ( m_cElements > 0 )
 	{
-		// remove all the current bits
-		m_bitsMigratedBuckets.Resize( 0 );
-		// re-add new bits; these will all be reset to 0
-		m_bitsMigratedBuckets.Resize( m_vecHashBuckets.Count() );
+		// we'll have to rehash, all the buckets that existed before growth
+		m_nNeedRehashStart = 0;
+		m_nNeedRehashEnd = iFirst;
 	}
 	else
 	{
-		// no elements - no rehashing
-		m_nMinRehashedBucket = m_vecHashBuckets.Count();
+		// no elements - no rehashing!
+		m_nNeedRehashStart = m_vecHashBuckets.Count();
+		m_nNeedRehashEnd = m_nNeedRehashStart;
+		m_nMinBucketMask = m_nNeedRehashStart-1;
 	}
 }
 
@@ -606,20 +632,20 @@ inline int CUtlHashMap<K,T,L,H>::AllocNode()
 template <typename K, typename T, typename L, typename H> 
 inline void CUtlHashMap<K,T,L,H>::RehashNodesInBucket( int iBucketSrc )
 {
-	// mark us as migrated
-	m_bitsMigratedBuckets.SetBit( iBucketSrc );
 
 	// walk the list of items, re-hashing them
-	IndexType_t iNode = m_vecHashBuckets[iBucketSrc].m_iNode;
-	while ( iNode != kInvalidIndex )
+	IndexType_t *pLink = &m_vecHashBuckets[iBucketSrc].m_iNode;
+	for (;;)
 	{
-		IndexType_t iNodeNext = m_memNodes[iNode].m_iNextNode;
-		DbgAssert( iNodeNext != iNode );
+		IndexType_t iNode = *pLink;
+		if ( iNode == kInvalidIndex )
+			break;
+		Node_t &node = m_memNodes[iNode];
+		DbgAssert( node.m_iNextNode != iNode );
 
 		// work out where the node should go
-		const KeyType_t &key = m_memNodes[iNode].m_key;
-		auto hash = m_HashFunc( key );
-		int iBucketDest = basetypes::ModPowerOf2( hash, m_vecHashBuckets.Count() );
+		int hash = (int)m_HashFunc( node.m_key );
+		int iBucketDest = hash & (m_vecHashBuckets.Count()-1);
 
 		// if the hash bucket has changed, move it
 		if ( iBucketDest != iBucketSrc )
@@ -627,12 +653,15 @@ inline void CUtlHashMap<K,T,L,H>::RehashNodesInBucket( int iBucketSrc )
 			//	::OutputDebugStr( CFmtStr( "moved key %d from bucket %d to %d\n", key, iBucketSrc, iBucketDest ).Access() );
 
 			// remove from this bucket list
-			UnlinkNodeFromBucket( iBucketSrc, iNode );
+			*pLink = node.m_iNextNode;
 
 			// link into new bucket list
 			LinkNodeIntoBucket( iBucketDest, iNode );
 		}
-		iNode = iNodeNext;
+		else
+		{
+			pLink = &node.m_iNextNode;
+		}
 	}
 }
 
@@ -646,36 +675,42 @@ inline int CUtlHashMap<K,T,L,H>::Find( const KeyType_t &key ) const
 	if ( m_cElements == 0 )
 		return kInvalidIndex;
 
+	// Rehash incrementally.  Note that this is really a "const"
+	// function, since it is only shuffling around the buckets.  The
+	// items do not move in memory, and their index does not change.
+	// So this can be called during iteration, etc.  The buckets are
+	// invisible to the app code.
+	//
+	// It's a better tradeoff to make this function slightly slower
+	// until we get rehashed, to make sure that we do eventually get
+	// rehashed, even if we have stopped Inserting.  This minimizes
+	// the number of back probes that need to be made.
+	//
+	// NOTE: This means that you cannot call the "read-only" Find()
+	// function from different threads at the same time!
+	if ( m_nNeedRehashStart < m_nNeedRehashEnd )
+		(const_cast<CUtlHashMap<K,T,L,H> *>( this ))->IncrementalRehash();
+
 	// hash the item
-	auto hash = m_HashFunc( key );
+	int hash = (int)m_HashFunc( key );
 
 	// find the bucket
-	int cBucketsToModAgainst = m_vecHashBuckets.Count();
-	int iBucket = basetypes::ModPowerOf2( hash, cBucketsToModAgainst );
-
-	// look in the bucket for the item
-	int iNode = FindInBucket( iBucket, key );
-	if ( iNode != kInvalidIndex )
-		return iNode;
-
-	// stop before calling ModPowerOf2( hash, 0 ), which just returns the 32-bit hash, overflowing m_vecHashBuckets
-	IndexType_t cMinBucketsToModAgainst = MAX( 1, m_nMinRehashedBucket );
-
-	// not found? we may have to look in older buckets
-	cBucketsToModAgainst >>= 1;
-	while ( cBucketsToModAgainst >= cMinBucketsToModAgainst)
+	int cBucketsMask = m_vecHashBuckets.Count()-1;
+	int iBucket = hash & cBucketsMask;
+	do 
 	{
-		iBucket = basetypes::ModPowerOf2( hash, cBucketsToModAgainst );
 
-		if ( !m_bitsMigratedBuckets.GetBit( iBucket ) )
-		{
-			int iNode2 = FindInBucket( iBucket, key );
-			if ( iNode2 != kInvalidIndex )
-				return iNode2;
-		}
+		// Look in the bucket for the item
+		int iNode = FindInBucket( iBucket, key );
+		if ( iNode != kInvalidIndex )
+			return iNode;
 
-		cBucketsToModAgainst >>= 1;
-	}
+		// Not found.  Might be in an older bucket.
+		cBucketsMask >>= 1;
+		if ( cBucketsMask < m_nMinBucketMask )
+			break;
+		iBucket = hash & cBucketsMask;
+	} while ( iBucket >= m_nNeedRehashStart );
 
 	return kInvalidIndex;	
 }
@@ -708,9 +743,10 @@ inline int CUtlHashMap<K, T, L, H>::NextSameKey( IndexType_t i ) const
 	{
 		const KeyType_t &key = m_memNodes[i].m_key;
 		IndexType_t iNode = m_memNodes[i].m_iNextNode;
-		DbgAssert( iNode < m_nMaxElement );
 		while ( iNode != kInvalidIndex )
 		{
+			DbgAssert( iNode < m_nMaxElement );
+
 			// equality check
 			if ( m_EqualityFunc( key, m_memNodes[iNode].m_key ) )
 				return iNode;
@@ -728,18 +764,17 @@ inline int CUtlHashMap<K, T, L, H>::NextSameKey( IndexType_t i ) const
 template <typename K, typename T, typename L, typename H> 
 inline int CUtlHashMap<K,T,L,H>::FindInBucket( int iBucket, const KeyType_t &key ) const
 {
-	if ( m_vecHashBuckets[iBucket].m_iNode != kInvalidIndex )
+	IndexType_t iNode = m_vecHashBuckets[iBucket].m_iNode;
+	while ( iNode != kInvalidIndex )
 	{
-		IndexType_t iNode = m_vecHashBuckets[iBucket].m_iNode;
 		DbgAssert( iNode < m_nMaxElement );
-		while ( iNode != kInvalidIndex )
-		{
-			// equality check
-			if ( m_EqualityFunc( key, m_memNodes[iNode].m_key ) )
-				return iNode;
 
-			iNode = m_memNodes[iNode].m_iNextNode;
-		}
+		// equality check
+		const Node_t &node = m_memNodes[iNode];
+		if ( m_EqualityFunc( key, node.m_key ) )
+			return iNode;
+
+		iNode = node.m_iNextNode;
 	}
 
 	return kInvalidIndex;
@@ -759,38 +794,6 @@ inline void CUtlHashMap<K,T,L,H>::LinkNodeIntoBucket( int iBucket, int iNewNode 
 
 
 //-----------------------------------------------------------------------------
-// Purpose: unlinks a node from the bucket
-//-----------------------------------------------------------------------------
-template <typename K, typename T, typename L, typename H> 
-inline void CUtlHashMap<K,T,L,H>::UnlinkNodeFromBucket( int iBucket, int iNodeToUnlink )
-{
-	int iNodeNext = m_memNodes[iNodeToUnlink].m_iNextNode;
-
-	// if it's the first node, just update the bucket to point to the new place
-	int iNode = m_vecHashBuckets[iBucket].m_iNode;
-	if ( iNode == iNodeToUnlink )
-	{
-		m_vecHashBuckets[iBucket].m_iNode = iNodeNext;
-		return;
-	}
-
-	// walk the list to find where
-	while ( iNode != kInvalidIndex )
-	{
-		if ( m_memNodes[iNode].m_iNextNode == iNodeToUnlink )
-		{
-			m_memNodes[iNode].m_iNextNode = iNodeNext;
-			return;
-		}
-		iNode = m_memNodes[iNode].m_iNextNode;
-	}
-
-	// should always be valid to unlink
-	DbgAssert( false );
-}
-
-
-//-----------------------------------------------------------------------------
 // Purpose: removes a single item from the map
 //-----------------------------------------------------------------------------
 template <typename K, typename T, typename L, typename H> 
@@ -802,30 +805,31 @@ inline void CUtlHashMap<K,T,L,H>::RemoveAt( IndexType_t i )
 		return;
 	}
 
+	// Rehash incrementally
+	if ( m_nNeedRehashStart < m_nNeedRehashEnd )
+		IncrementalRehash();
+
 	// unfortunately, we have to re-hash to find which bucket we're in
-	auto hash = m_HashFunc( m_memNodes[i].m_key );
-	int cBucketsToModAgainst = m_vecHashBuckets.Count();
-	int iBucket = basetypes::ModPowerOf2( hash, cBucketsToModAgainst );
-	if ( RemoveNodeFromBucket( iBucket, i ) )
+	int hash = (int)m_HashFunc( m_memNodes[i].m_key );
+	int nBucketMask = m_vecHashBuckets.Count()-1;
+	if ( RemoveNodeFromBucket( hash & nBucketMask, i ) )
 		return;
 
 	// wasn't found; look in older buckets
-	cBucketsToModAgainst >>= 1;
-	while ( cBucketsToModAgainst >= m_nMinRehashedBucket )
+	for (;;)
 	{
-		iBucket = basetypes::ModPowerOf2( hash, cBucketsToModAgainst );
-
-		if ( !m_bitsMigratedBuckets.GetBit( iBucket ) )
-		{
-			if ( RemoveNodeFromBucket( iBucket, i ) )
-				return;
-		}
-
-		cBucketsToModAgainst >>= 1;
+		nBucketMask >>= 1;
+		if ( nBucketMask < m_nMinBucketMask )
+			break;
+		int iBucket = hash & nBucketMask;
+		if ( iBucket < m_nNeedRehashStart )
+			break;
+		if ( RemoveNodeFromBucket( iBucket, i ) )
+			return;
 	}
 
 	// never found, container is busted
-	DbgAssert( false );
+	Assert( false );
 }
 
 
@@ -835,28 +839,38 @@ inline void CUtlHashMap<K,T,L,H>::RemoveAt( IndexType_t i )
 template <typename K, typename T, typename L, typename H> 
 inline bool CUtlHashMap<K,T,L,H>::RemoveNodeFromBucket( IndexType_t iBucket, int iNodeToRemove )
 {
-	IndexType_t iNode = m_vecHashBuckets[iBucket].m_iNode;
-	while ( iNode != kInvalidIndex )
+	// walk the list of items
+	IndexType_t *pLink = &m_vecHashBuckets[iBucket].m_iNode;
+	for (;;)
 	{
+		IndexType_t iNode = *pLink;
+		if ( iNode == kInvalidIndex )
+			break;
+		Node_t &node = m_memNodes[iNode];
+		DbgAssert( node.m_iNextNode != iNode );
+
 		if ( iNodeToRemove == iNode )
 		{
 			// found it, remove
-			UnlinkNodeFromBucket( iBucket, iNodeToRemove );
-			Destruct( &m_memNodes[iNode].m_key );
-			Destruct( &m_memNodes[iNode].m_elem );
+			*pLink = node.m_iNextNode;
+			Destruct( &node.m_key );
+			Destruct( &node.m_elem );
 
 			// link into free list
-			m_memNodes[iNode].m_iNextNode = FreeNodeIndexToID( m_iNodeFreeListHead );
+			node.m_iNextNode = FreeNodeIndexToID( m_iNodeFreeListHead );
 			m_iNodeFreeListHead = iNode;
 			m_cElements--;
 			if ( m_cElements == 0 )
 			{
-				m_nMinRehashedBucket = m_vecHashBuckets.Count();
+				// No items left in container, so no rehashing necessary
+				m_nNeedRehashStart = m_vecHashBuckets.Count();
+				m_nNeedRehashEnd = m_nNeedRehashStart;
+				m_nMinBucketMask = m_vecHashBuckets.Count()-1;
 			}
 			return true;
 		}
 
-		iNode = m_memNodes[iNode].m_iNextNode;
+		pLink = &node.m_iNextNode;
 	}
 
 	return false;
@@ -873,16 +887,18 @@ inline void CUtlHashMap<K,T,L,H>::RemoveAll()
 	{
 		FOR_EACH_HASHMAP( *this, i )
 		{
-			Destruct( &m_memNodes[i].m_key );
-			Destruct( &m_memNodes[i].m_elem );
+			Node_t &node = m_memNodes[i];
+			Destruct( &node.m_key );
+			Destruct( &node.m_elem );
 		}
 
 		m_cElements = 0;
 		m_nMaxElement = 0;
 		m_iNodeFreeListHead = kInvalidIndex;
-		m_nMinRehashedBucket = m_vecHashBuckets.Count();
-		m_nMaxRehashedBucket = kInvalidIndex;
-		m_bitsMigratedBuckets.Resize( 0 );
+		m_nNeedRehashStart = m_vecHashBuckets.Count();
+		m_nNeedRehashEnd = m_nNeedRehashStart;
+		DbgAssert( m_vecHashBuckets.Count() >= 2 );
+		m_nMinBucketMask = m_vecHashBuckets.Count()-1;
 		memset( m_vecHashBuckets.Base(), 0xFF, m_vecHashBuckets.Count() * sizeof(HashBucket_t) );
 	}
 }
@@ -898,17 +914,18 @@ inline void CUtlHashMap<K,T,L,H>::Purge()
 	{
 		FOR_EACH_HASHMAP( *this, i )
 		{
-			Destruct( &m_memNodes[i].m_key );
-			Destruct( &m_memNodes[i].m_elem );
+			Node_t &node = m_memNodes[i];
+			Destruct( &node.m_key );
+			Destruct( &node.m_elem );
 		}
 	}
 
 	m_cElements = 0;
 	m_nMaxElement = 0;
 	m_iNodeFreeListHead = kInvalidIndex;
-	m_nMinRehashedBucket = kInvalidIndex;
-	m_nMaxRehashedBucket = kInvalidIndex;
-	m_bitsMigratedBuckets.Resize( 0 );
+	m_nNeedRehashStart = 0;
+	m_nNeedRehashEnd = 0;
+	m_nMinBucketMask = 1;
 	m_vecHashBuckets.Purge();
 	m_memNodes.Purge();
 }
@@ -920,33 +937,32 @@ inline void CUtlHashMap<K,T,L,H>::Purge()
 template <typename K, typename T, typename L, typename H> 
 inline void CUtlHashMap<K,T,L,H>::IncrementalRehash()
 {
-	if ( m_nMinRehashedBucket < m_nMaxRehashedBucket )
+	// Each call site should check this, to avoid the function call in the
+	// common case where the table is already clean.
+	DbgAssert( m_nNeedRehashStart < m_nNeedRehashEnd );
+
+	do
 	{
-		while ( m_nMinRehashedBucket < m_nMaxRehashedBucket )
-		{
-			// see if the bucket needs rehashing
-			if ( m_vecHashBuckets[m_nMinRehashedBucket].m_iNode != kInvalidIndex 
-				&& !m_bitsMigratedBuckets.GetBit(m_nMinRehashedBucket) )
-			{
-				// rehash this bucket
-				RehashNodesInBucket( m_nMinRehashedBucket );
-				// only actively do one - don't want to do it too fast since we may be on a rapid growth path
-				++m_nMinRehashedBucket;
-				break;
-			}
+		int iBucketSrc = m_nNeedRehashStart;
+		++m_nNeedRehashStart;
 
-			// nothing to rehash in that bucket - increment and look again
-			++m_nMinRehashedBucket;
-		}
-
-		if ( m_nMinRehashedBucket >= m_nMaxRehashedBucket )
+		// Bucket empty?
+		if ( m_vecHashBuckets[iBucketSrc].m_iNode != kInvalidIndex )
 		{
-			// we're done; don't need any bits anymore
-			m_nMinRehashedBucket = m_vecHashBuckets.Count();
-			m_nMaxRehashedBucket = kInvalidIndex;
-			m_bitsMigratedBuckets.Resize( 0 );
+			RehashNodesInBucket( iBucketSrc );
+
+			// only actively do one - don't want to do it too fast since we may be on a rapid growth path
+			if ( m_nNeedRehashStart < m_nNeedRehashEnd )
+				return;
+			break;
 		}
-	}
+	} while ( m_nNeedRehashStart < m_nNeedRehashEnd );
+
+	// We're done; don't need any bits anymore
+	DbgAssert( m_vecHashBuckets.Count() >= 2 );
+	m_nNeedRehashStart = m_vecHashBuckets.Count();
+	m_nNeedRehashEnd = m_nNeedRehashStart;
+	m_nMinBucketMask = m_vecHashBuckets.Count()-1;
 }
 
 
@@ -957,13 +973,13 @@ template <typename K, typename T, typename L, typename H>
 inline void CUtlHashMap<K,T,L,H>::Swap( CUtlHashMap<K,T,L,H> &that )
 {
 	m_vecHashBuckets.Swap( that.m_vecHashBuckets );
-	SWAP( m_bitsMigratedBuckets, that.m_bitsMigratedBuckets );
 	m_memNodes.Swap( that.m_memNodes );
 	SWAP( m_iNodeFreeListHead, that.m_iNodeFreeListHead );
 	SWAP( m_cElements, that.m_cElements );
 	SWAP( m_nMaxElement, that.m_nMaxElement );
-	SWAP( m_nMinRehashedBucket, that.m_nMinRehashedBucket );
-	SWAP( m_nMaxRehashedBucket, that.m_nMaxRehashedBucket );
+	SWAP( m_nNeedRehashStart, that.m_nNeedRehashStart );
+	SWAP( m_nNeedRehashEnd, that.m_nNeedRehashEnd );
+	SWAP( m_nMinBucketMask, that.m_nMinBucketMask );
 }
 
 #endif // UTLHASHMAP_H

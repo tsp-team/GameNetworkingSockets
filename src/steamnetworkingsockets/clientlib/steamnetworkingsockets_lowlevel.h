@@ -175,6 +175,7 @@ extern bool CreateBoundSocketPair( CRecvPacketCallback callback1, CRecvPacketCal
 class CSharedSocket
 {
 public:
+	STEAMNETWORKINGSOCKETS_DECLARE_CLASS_OPERATOR_NEW
 	CSharedSocket();
 	~CSharedSocket();
 
@@ -220,6 +221,7 @@ private:
 		friend class CSharedSocket;
 		inline virtual ~RemoteHost() {}
 	public:
+		STEAMNETWORKINGSOCKETS_DECLARE_CLASS_OPERATOR_NEW
 		inline RemoteHost( IRawUDPSocket *pRawSock, const netadr_t &adr ) : IBoundUDPSocket( pRawSock, adr ) {}
 		CRecvPacketCallback m_callback;
 		CSharedSocket *m_pOwner;
@@ -254,33 +256,46 @@ extern void ProcessPendingDestroyClosedRawUDPSockets();
 
 /// Last time that we spewed something that was subject to rate limit 
 extern SteamNetworkingMicroseconds g_usecLastRateLimitSpew;
+extern int g_nRateLimitSpewCount;
 
 /// Check for rate limiting spew (e.g. when spew could be triggered by malicious sender.)
 inline bool BRateLimitSpew( SteamNetworkingMicroseconds usecNow )
 {
-	if ( usecNow < g_usecLastRateLimitSpew + 100000 )
-		return false;
-	g_usecLastRateLimitSpew = usecNow;
+	if ( g_nRateLimitSpewCount <= 0 )
+	{
+		if ( usecNow < g_usecLastRateLimitSpew + 300000 )
+			return false;
+		g_usecLastRateLimitSpew = usecNow;
+		g_nRateLimitSpewCount = 3; // Allow a short burst, because sometimes we need messages from different levels on the call stack
+	}
+	--g_nRateLimitSpewCount;
 	return true;
 }
 
-extern ESteamNetworkingSocketsDebugOutputType g_eSteamDatagramDebugOutputDetailLevel;
-extern void ReallySpewType( ESteamNetworkingSocketsDebugOutputType eType, PRINTF_FORMAT_STRING const char *pMsg, ... ) FMTFUNCTION( 2, 3 );
-extern void VReallySpewType( ESteamNetworkingSocketsDebugOutputType eType, const char *pMsg, va_list ap );
-#define SpewType( eType, ... ) ( ( (eType) <= g_eSteamDatagramDebugOutputDetailLevel ) ? ReallySpewType( ESteamNetworkingSocketsDebugOutputType(eType), __VA_ARGS__ ) : (void)0 )
-#define SpewMsg( ... ) SpewType( k_ESteamNetworkingSocketsDebugOutputType_Msg, __VA_ARGS__ )
-#define SpewVerbose( ... ) SpewType( k_ESteamNetworkingSocketsDebugOutputType_Verbose, __VA_ARGS__ )
-#define SpewDebug( ... ) SpewType( k_ESteamNetworkingSocketsDebugOutputType_Debug, __VA_ARGS__ )
-#define SpewImportant( ... ) SpewType( k_ESteamNetworkingSocketsDebugOutputType_Important, __VA_ARGS__ )
-#define SpewWarning( ... ) SpewType( k_ESteamNetworkingSocketsDebugOutputType_Warning, __VA_ARGS__ )
-#define SpewError( ... ) SpewType( k_ESteamNetworkingSocketsDebugOutputType_Error, __VA_ARGS__ )
-#define SpewBug( ... ) SpewType( k_ESteamNetworkingSocketsDebugOutputType_Bug, __VA_ARGS__ )
+extern ESteamNetworkingSocketsDebugOutputType g_eDefaultGroupSpewLevel;
+extern void ReallySpewTypeFmt( int eType, PRINTF_FORMAT_STRING const char *pFmt, ... ) FMTFUNCTION( 2, 3 );
+extern void (*g_pfnPreFormatSpewHandler)( ESteamNetworkingSocketsDebugOutputType eType, bool bFmt, const char* pstrFile, int nLine, const char *pMsg, va_list ap );
 
-#define SpewTypeRateLimited( usecNow, eType, ... ) ( ( (eType) <= g_eSteamDatagramDebugOutputDetailLevel && BRateLimitSpew( usecNow ) ) ? ReallySpewType( (eType), __VA_ARGS__ ) : (void)0 )
-#define SpewMsgRateLimited( usecNow, ... ) SpewTypeRateLimited( usecNow, k_ESteamNetworkingSocketsDebugOutputType_Msg, __VA_ARGS__ )
-#define SpewWarningRateLimited( usecNow, ... ) SpewTypeRateLimited( usecNow, k_ESteamNetworkingSocketsDebugOutputType_Warning, __VA_ARGS__ )
-#define SpewErrorRateLimited( usecNow, ... ) SpewTypeRateLimited( usecNow, k_ESteamNetworkingSocketsDebugOutputType_Error, __VA_ARGS__ )
-#define SpewBugRateLimited( usecNow, ... ) SpewTypeRateLimited( usecNow, k_ESteamNetworkingSocketsDebugOutputType_Bug, __VA_ARGS__ )
+#define SpewTypeGroup( eType, nGroup, ... ) ( ( (eType) <= (nGroup) ) ? ReallySpewTypeFmt( (eType), __VA_ARGS__ ) : (void)0 )
+#define SpewMsgGroup( nGroup, ... ) SpewTypeGroup( k_ESteamNetworkingSocketsDebugOutputType_Msg, (nGroup), __VA_ARGS__ )
+#define SpewVerboseGroup( nGroup, ... ) SpewTypeGroup( k_ESteamNetworkingSocketsDebugOutputType_Verbose, (nGroup), __VA_ARGS__ )
+#define SpewDebugGroup( nGroup, ... ) SpewTypeGroup( k_ESteamNetworkingSocketsDebugOutputType_Debug, (nGroup), __VA_ARGS__ )
+#define SpewImportantGroup( nGroup, ... ) SpewTypeGroup( k_ESteamNetworkingSocketsDebugOutputType_Important, (nGroup), __VA_ARGS__ )
+#define SpewWarningGroup( nGroup, ... ) SpewTypeGroup( k_ESteamNetworkingSocketsDebugOutputType_Warning, (nGroup), __VA_ARGS__ )
+#define SpewErrorGroup( nGroup, ... ) SpewTypeGroup( k_ESteamNetworkingSocketsDebugOutputType_Error, (nGroup), __VA_ARGS__ )
+#define SpewBugGroup( nGroup, ... ) SpewTypeGroup( k_ESteamNetworkingSocketsDebugOutputType_Bug, (nGroup), __VA_ARGS__ )
+
+#define SpewTypeDefaultGroup( eType, ... ) SpewTypeGroup( eType, g_eDefaultGroupSpewLevel, __VA_ARGS__ )
+#define SpewMsg( ... ) SpewTypeDefaultGroup( k_ESteamNetworkingSocketsDebugOutputType_Msg, __VA_ARGS__ )
+#define SpewVerbose( ... ) SpewTypeDefaultGroup( k_ESteamNetworkingSocketsDebugOutputType_Verbose, __VA_ARGS__ )
+#define SpewDebug( ... ) SpewTypeDefaultGroup( k_ESteamNetworkingSocketsDebugOutputType_Debug, __VA_ARGS__ )
+#define SpewImportant( ... ) SpewTypeDefaultGroup( k_ESteamNetworkingSocketsDebugOutputType_Important, __VA_ARGS__ )
+#define SpewWarning( ... ) SpewTypeDefaultGroup( k_ESteamNetworkingSocketsDebugOutputType_Warning, __VA_ARGS__ )
+#define SpewError( ... ) SpewTypeDefaultGroup( k_ESteamNetworkingSocketsDebugOutputType_Error, __VA_ARGS__ )
+#define SpewBug( ... ) SpewTypeDefaultGroup( k_ESteamNetworkingSocketsDebugOutputType_Bug, __VA_ARGS__ )
+
+#define SpewTypeDefaultGroupRateLimited( usecNow, eType, ... ) ( ( (eType) <= g_eDefaultGroupSpewLevel && BRateLimitSpew( usecNow ) ) ? ReallySpewTypeFmt( (eType), __VA_ARGS__ ) : (void)0 )
+#define SpewWarningRateLimited( usecNow, ... ) SpewTypeDefaultGroupRateLimited( usecNow, k_ESteamNetworkingSocketsDebugOutputType_Warning, __VA_ARGS__ )
 
 /// Make sure stuff is initialized
 extern bool BSteamNetworkingSocketsLowLevelAddRef( SteamDatagramErrMsg &errMsg );
@@ -324,11 +339,11 @@ extern void WakeSteamDatagramThread();
 /// Class used to take some action while we have the global thread locked,
 /// perhaps later and in another thread if necessary.  Intended to be used
 /// from callbacks and other contexts where we don't know what thread we are
-/// in and cannot risk trying to waiton the lock, without risking creating
+/// in and cannot risk trying to wait on the lock, without risking creating
 /// a deadlock.
 ///
 /// Note: This code could have been a lot simpler with std::function, but
-/// it was intentionally notused, to avoid adding that runtime dependency.
+/// it was intentionally not used, to avoid adding that runtime dependency.
 class ISteamNetworkingSocketsRunWithLock
 {
 public:
@@ -377,5 +392,7 @@ protected:
 #endif
 
 } // namespace SteamNetworkingSocketsLib
+
+STEAMNETWORKINGSOCKETS_INTERFACE void SteamNetworkingSockets_DefaultPreFormatDebugOutputHandler( ESteamNetworkingSocketsDebugOutputType eType, bool bFmt, const char* pstrFile, int nLine, const char *pMsg, va_list ap );
 
 #endif // STEAMNETWORKINGSOCKETS_LOWLEVEL_H
